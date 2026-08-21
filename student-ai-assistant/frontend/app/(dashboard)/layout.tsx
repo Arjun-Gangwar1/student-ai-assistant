@@ -1,9 +1,10 @@
 import Link from "next/link";
-import { LayoutDashboard, CalendarClock, MessageSquare, Settings } from "lucide-react";
+import { LayoutDashboard, CalendarClock, Mail, MessageSquare, Settings } from "lucide-react";
 
 const NAV = [
   { href: "/dashboard", icon: LayoutDashboard, label: "Home" },
   { href: "/deadlines",  icon: CalendarClock,   label: "Deadlines" },
+  { href: "/emails",     icon: Mail,           label: "Email" },
   { href: "/chat",       icon: MessageSquare,   label: "Ask AI" },
 ];
 

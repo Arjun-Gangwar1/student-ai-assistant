@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useRef, useEffect } from "react";
-import { askQuestion, getMe, type Source } from "@/lib/api-client";
+import { ApiError, askQuestion, type Source } from "@/lib/api-client";
 import { Send, Loader2 } from "lucide-react";
 
 const SUGGESTIONS = [
@@ -21,21 +21,15 @@ export default function ChatPage() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
-  const [studentId, setStudentId] = useState<string>("");
+  const [quotaLeft, setQuotaLeft] = useState<number | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    getMe()
-      .then((me) => setStudentId(me.student_id))
-      .catch(() => { window.location.href = "/"; });
-  }, []);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
   const sendMessage = async (question: string) => {
-    if (!question.trim() || loading || !studentId) return;
+    if (!question.trim() || loading) return;
 
     const userMsg: Message = { role: "user", content: question };
     setMessages((prev) => [...prev, userMsg]);
@@ -43,16 +37,29 @@ export default function ChatPage() {
     setLoading(true);
 
     try {
+      // No student id: the session identifies the asker, so one student can
+      // never pose a question answered from another's retrieved context.
       const history = messages.map((m) => ({ role: m.role, content: m.content }));
-      const res = await askQuestion(studentId, question, history);
+      const res = await askQuestion(question, history);
+      setQuotaLeft(res.remaining_today);
       setMessages((prev) => [
         ...prev,
         { role: "assistant", content: res.answer, sources: res.sources },
       ]);
-    } catch {
+    } catch (err) {
+      if (err instanceof ApiError && err.isUnauthenticated) {
+        window.location.href = "/";
+        return;
+      }
       setMessages((prev) => [
         ...prev,
-        { role: "assistant", content: "Sorry, I couldn't process that. Please try again." },
+        {
+          role: "assistant",
+          content:
+            err instanceof ApiError && err.isRateLimited
+              ? err.message
+              : "Sorry, I couldn't process that. Please try again.",
+        },
       ]);
     } finally {
       setLoading(false);
@@ -61,7 +68,12 @@ export default function ChatPage() {
 
   return (
     <div className="flex flex-col h-[calc(100vh-8rem)]">
-      <h1 className="text-xl font-bold mb-3 text-slate-100 flex-shrink-0">Ask AI</h1>
+      <div className="flex items-baseline justify-between mb-3 flex-shrink-0">
+        <h1 className="text-xl font-bold text-slate-100">Ask AI</h1>
+        {quotaLeft !== null && (
+          <span className="text-xs text-slate-500">{quotaLeft} questions left today</span>
+        )}
+      </div>
 
       {/* Messages */}
       <div className="flex-1 overflow-y-auto scrollbar-hide space-y-4 pr-1">
