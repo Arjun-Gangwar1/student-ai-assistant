@@ -34,9 +34,21 @@ def to_utc(dt: datetime) -> datetime:
     return ensure_aware(dt).astimezone(UTC)
 
 
+def hours_until_exact(dt: datetime) -> float:
+    """Fractional hours from now until `dt`. Negative once it has passed."""
+    return (ensure_aware(dt) - now_utc()).total_seconds() / 3600
+
+
 def hours_until(dt: datetime) -> int:
-    """Whole hours from now until `dt`. Negative once it has passed."""
-    return int((ensure_aware(dt) - now_utc()).total_seconds() // 3600)
+    """
+    Hours remaining, rounded to nearest, for display.
+
+    Rounded rather than floored: a deadline 4h59m away is "5h left" to a person,
+    and flooring showed "4h". Comparisons against thresholds must use
+    hours_until_exact — rounding a boundary value is how "25 hours away" ended
+    up classified as due-within-24h.
+    """
+    return round(hours_until_exact(dt))
 
 
 def days_until(dt: datetime) -> int:
@@ -51,7 +63,8 @@ def days_until(dt: datetime) -> int:
 
 
 def priority_from_deadline(dt: datetime) -> str:
-    hours = hours_until(dt)
+    """Exact hours, not the rounded display value — see hours_until."""
+    hours = hours_until_exact(dt)
     if hours <= 24:
         return "HIGH"
     if hours <= 72:
@@ -92,15 +105,15 @@ def parse_classroom_date(due_date: dict, due_time: dict | None = None) -> dateti
 def format_deadline_for_telegram(dt: datetime) -> str:
     """Human-friendly deadline string, IST."""
     ist = to_ist(dt)
-    hours = hours_until(dt)
+    hours = hours_until_exact(dt)
     days = days_until(dt)
     clock = ist.strftime("%I:%M %p").lstrip("0")
 
     if hours < 0:
-        overdue = abs(hours)
+        overdue = abs(int(hours))
         return f"overdue by {overdue}h" if overdue < 48 else f"overdue by {overdue // 24}d"
     if days == 0:
-        return f"today at {clock} ({hours}h left)"
+        return f"today at {clock} ({hours_until(dt)}h left)"
     if days == 1:
         return f"tomorrow at {clock}"
     return f"{ist.strftime('%a %d %b')} at {clock} ({days}d left)"
@@ -108,11 +121,11 @@ def format_deadline_for_telegram(dt: datetime) -> str:
 
 def humanize_time_left(dt: datetime) -> str:
     """Compact form for dense lists: '6h', '2d', 'overdue'."""
-    hours = hours_until(dt)
+    hours = hours_until_exact(dt)
     if hours < 0:
         return "overdue"
     if hours < 24:
-        return f"{hours}h"
+        return f"{hours_until(dt)}h"
     return f"{days_until(dt)}d"
 
 

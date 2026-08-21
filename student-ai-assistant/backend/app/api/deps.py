@@ -30,8 +30,8 @@ logger = logging.getLogger(__name__)
 SESSION_STUDENT_ID = "student_id"
 
 
-async def get_current_student_id(request: Request) -> str:
-    """The authenticated student's id, from the signed session cookie."""
+async def _session_student_id(request: Request) -> str:
+    """Raw id from the signed session cookie. Not yet known to exist."""
     student_id = request.session.get(SESSION_STUDENT_ID)
     if not student_id:
         raise HTTPException(
@@ -44,16 +44,25 @@ async def get_current_student_id(request: Request) -> str:
 
 async def get_current_student(
     request: Request,
-    student_id: Annotated[str, Depends(get_current_student_id)],
+    student_id: Annotated[str, Depends(_session_student_id)],
 ) -> dict:
     """
     The full student record.
 
     Re-read from the database on every request rather than trusted from the
-    cookie, so that a deleted account stops working immediately instead of
-    whenever its session happens to expire.
+    cookie, so a deleted account stops working immediately instead of whenever
+    its session happens to expire. One indexed primary-key lookup, and FastAPI
+    caches the dependency within a request, so it costs one query per request
+    no matter how many dependants ask for it.
     """
-    student = await queries.get_student(student_id)
+    try:
+        student = await queries.get_student(student_id)
+    except Exception as exc:
+        # A malformed id in a signed cookie means the signing key was reused
+        # across incompatible deployments. Treat as unauthenticated, not a 500.
+        logger.warning("Session lookup failed for %r: %s", student_id, exc)
+        student = None
+
     if student is None:
         # Account deleted, or the session key rotated. Drop the stale cookie so
         # the browser stops replaying it on every subsequent request.
@@ -64,6 +73,20 @@ async def get_current_student(
             detail="Session is no longer valid. Please sign in again.",
         )
     return student
+
+
+async def get_current_student_id(
+    student: Annotated[dict, Depends(get_current_student)],
+) -> str:
+    """
+    The authenticated student's id, verified to exist.
+
+    Deliberately derived from the full record rather than read straight off the
+    cookie. Taking it from the session alone meant a validly-signed session for
+    a deleted account kept working — so a DPDP erasure request did not actually
+    end the user's active sessions.
+    """
+    return str(student["id"])
 
 
 async def get_current_student_with_tokens(
