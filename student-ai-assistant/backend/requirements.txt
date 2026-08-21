@@ -1,0 +1,62 @@
+# Web framework
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+python-multipart==0.0.9
+
+# Database
+supabase==2.7.4
+asyncpg==0.29.0
+pgvector==0.3.2
+
+# Google APIs
+google-auth==2.35.0
+google-auth-oauthlib==1.2.1
+google-api-python-client==2.149.0
+
+# LLM providers
+groq==0.11.0
+google-generativeai==0.8.3
+openai==1.52.0
+
+# Embeddings (local, free — no OpenAI quota needed)
+sentence-transformers==3.3.1
+
+# HTTP client
+httpx==0.27.2
+aiohttp==3.10.10
+
+# Web scraping
+beautifulsoup4==4.12.3
+lxml==5.3.0
+playwright==1.48.0
+
+# Task scheduling
+apscheduler==3.10.4
+rq==1.16.2
+redis==5.1.1
+
+# Telegram Bot
+python-telegram-bot==21.6
+
+# Data processing
+pydantic==2.9.2
+pydantic-settings==2.5.2
+python-dateutil==2.9.0
+pytz==2024.2
+
+# PDF / document parsing
+pypdf2==3.0.1
+pdfplumber==0.11.4
+python-docx>=1.1.0
+
+# Utilities
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+python-dotenv==1.0.1
+tenacity==9.0.0          # retry logic
+itsdangerous==2.2.0      # session middleware
+
+# Dev
+pytest==8.3.3
+pytest-asyncio==0.24.0
+httpx==0.27.2            # test client

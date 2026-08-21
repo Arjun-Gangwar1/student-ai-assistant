@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+venv/
+.venv/
+*.egg-info/
+dist/
+build/
+
+# Environment — NEVER commit real secrets
+.env
+.env.local
+.env.production
+
+# Node
+node_modules/
+.next/
+*.tsbuildinfo
+
+# Sentence-transformers model cache
+.cache/
+models/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
