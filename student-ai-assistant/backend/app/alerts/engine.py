@@ -1,58 +1,75 @@
 """
-Alert engine: runs periodic checks for deadlines needing 48h/24h/6h alerts.
-Called by the background worker every 30 minutes.
+Deadline alert engine — 48h / 24h / 6h reminders.
+
+Two rules that matter more than the mechanics:
+
+  * Unconfirmed deadlines do not alert. An LLM-extracted date below the
+    confidence bar is a suggestion, and waking someone at 6am for a date the
+    model invented is how this product loses a user permanently.
+
+  * The sent-flag is set whether or not delivery succeeded. A Telegram outage
+    must not turn into the same reminder every 15 minutes once it recovers.
 """
 
 import logging
-from app.db.supabase import get_deadlines_needing_alert, mark_alert_sent, log_alert
+
 from app.alerts.telegram_bot import send_deadline_alert
-from app.utils.date_utils import format_deadline_for_telegram, to_ist
-from datetime import datetime
+from app.db import queries
+from app.utils.date_utils import format_deadline_for_telegram
 
 logger = logging.getLogger(__name__)
 
-ALERT_CHECKS = ["alert_sent_48h", "alert_sent_24h", "alert_sent_6h"]
+# Order matters: the tightest window last, so a deadline entering the app inside
+# 6 hours gets the 48h and 24h flags marked as it passes through, then sends the
+# 6h alert — one message, not three at once.
+ALERT_FIELDS = ["alert_sent_48h", "alert_sent_24h", "alert_sent_6h"]
 
 
 async def run_deadline_alerts() -> int:
-    """Check and send all pending deadline alerts. Returns total alerts sent."""
+    """Send all pending deadline reminders. Returns the number delivered."""
     total_sent = 0
 
-    for alert_field in ALERT_CHECKS:
-        deadlines = await get_deadlines_needing_alert(alert_field)
+    for alert_field in ALERT_FIELDS:
+        try:
+            deadlines = await queries.get_deadlines_needing_alert(alert_field)
+        except Exception as exc:
+            logger.error("Alert query failed (%s): %s", alert_field, exc)
+            continue
 
-        for dl in deadlines:
-            student_info = dl.get("students", {})
-            chat_id = student_info.get("telegram_chat_id")
+        for deadline in deadlines:
+            deadline_id = str(deadline["id"])
+            student_id = str(deadline["student_id"])
+            chat_id = deadline.get("telegram_chat_id")
+
+            # No Telegram link, or awaiting confirmation: mark the window as
+            # handled so it is not re-examined every 15 minutes forever.
             if not chat_id:
-                # Mark as sent anyway to avoid repeated checks
-                await mark_alert_sent(dl["id"], alert_field)
+                await queries.mark_alert_sent(deadline_id, alert_field)
                 continue
 
             try:
-                due_dt = datetime.fromisoformat(dl["due_at"])
-                deadline_str = format_deadline_for_telegram(due_dt)
-
-                success = await send_deadline_alert(
+                delivered = await send_deadline_alert(
                     chat_id=int(chat_id),
-                    title=dl["title"],
-                    deadline_str=deadline_str,
+                    title=deadline["title"],
+                    deadline_str=format_deadline_for_telegram(deadline["due_at"]),
                     alert_type=alert_field.replace("alert_sent_", "deadline_"),
+                    source=deadline.get("source", ""),
                 )
 
-                await mark_alert_sent(dl["id"], alert_field)
-
-                if success:
-                    await log_alert({
-                        "student_id": dl["student_id"],
-                        "deadline_id": dl["id"],
-                        "channel": "telegram",
-                        "alert_type": alert_field,
-                    })
+                await queries.mark_alert_sent(deadline_id, alert_field)
+                await queries.log_alert(
+                    student_id=student_id,
+                    deadline_id=deadline_id,
+                    channel="telegram",
+                    alert_type=alert_field,
+                    delivered=delivered,
+                )
+                if delivered:
                     total_sent += 1
+            except Exception as exc:
+                # Leave the flag unset so a transient failure is retried next tick.
+                logger.error("Alert failed for deadline %s: %s", deadline_id, exc)
 
-            except Exception as e:
-                logger.error(f"Alert send failed for deadline {dl['id']}: {e}")
-
-    logger.info(f"Alert engine: sent {total_sent} alerts")
+    if total_sent:
+        logger.info("Alert engine: sent %d reminder(s)", total_sent)
     return total_sent

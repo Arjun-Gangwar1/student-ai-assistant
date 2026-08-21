@@ -37,7 +37,7 @@ class LLMError(RuntimeError):
 
 class BaseLLMClient(ABC):
     name: str
-    model: str
+    model: str          # set per-instance from settings, not a class constant
 
     @abstractmethod
     async def chat(
@@ -52,13 +52,13 @@ class BaseLLMClient(ABC):
 
 class GroqClient(BaseLLMClient):
     name = "groq"
-    model = "llama-3.1-8b-instant"
 
     def __init__(self) -> None:
         from groq import AsyncGroq
 
         if not settings.groq_api_key:
             raise LLMError("GROQ_API_KEY is not set")
+        self.model = settings.groq_model
         self._client = AsyncGroq(api_key=settings.groq_api_key, timeout=30.0)
 
     @retry(
@@ -90,16 +90,16 @@ class GroqClient(BaseLLMClient):
 
 
 class DeepInfraClient(BaseLLMClient):
-    """Fallback — same Llama model, OpenAI-compatible API."""
+    """Fallback provider, OpenAI-compatible API."""
 
     name = "deepinfra"
-    model = "meta-llama/Meta-Llama-3.1-8B-Instruct"
 
     def __init__(self) -> None:
         from openai import AsyncOpenAI
 
         if not settings.deepinfra_api_key:
             raise LLMError("DEEPINFRA_API_KEY is not set")
+        self.model = settings.deepinfra_model
         self._client = AsyncOpenAI(
             api_key=settings.deepinfra_api_key,
             base_url="https://api.deepinfra.com/v1/openai",

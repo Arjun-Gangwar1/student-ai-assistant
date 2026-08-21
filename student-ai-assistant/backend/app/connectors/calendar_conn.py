@@ -1,125 +1,146 @@
 """
 Google Calendar connector.
-Scope used (SENSITIVE — no CASA):
-  - https://www.googleapis.com/auth/calendar.events.readonly
+
+Scope: calendar.events.readonly (SENSITIVE — no CASA assessment).
 """
 
 import logging
-from datetime import datetime, timezone, timedelta
-from googleapiclient.discovery import build
-from google.oauth2.credentials import Credentials
-from tenacity import retry, stop_after_attempt, wait_exponential
+from datetime import datetime, timedelta
 
-from app.db.supabase import upsert_item, upsert_deadline
+from starlette.concurrency import run_in_threadpool
+
+from app.connectors.google_auth import GoogleAuthError, build_service, has_scope
+from app.db import queries
+from app.utils.date_utils import IST, UTC, now_utc
 
 logger = logging.getLogger(__name__)
 
-CALENDAR_SCOPES = [
-    "https://www.googleapis.com/auth/calendar.events.readonly",
-]
+LOOKAHEAD_DAYS = 60
+MAX_EVENTS = 250
+
+# All-day events and multi-day blocks are context, not deadlines. Creating a
+# "deadline" for a week-long fest produces an alert at 05:59 on a day nothing is
+# actually due.
+SKIP_DEADLINE_EVENT_TYPES = {"outOfOffice", "focusTime", "workingLocation", "birthday"}
 
 
-def build_service(token_data: dict):
-    creds = Credentials(
-        token=token_data.get("access_token"),
-        refresh_token=token_data.get("refresh_token"),
-        token_uri="https://oauth2.googleapis.com/token",
-        client_id=token_data.get("client_id"),
-        client_secret=token_data.get("client_secret"),
-        scopes=CALENDAR_SCOPES,
-    )
-    return build("calendar", "v3", credentials=creds, cache_discovery=False)
+def _parse_event_time(node: dict) -> tuple[datetime | None, bool]:
+    """
+    Parse a Calendar start/end node.
+    Returns (datetime in UTC, is_all_day).
+    """
+    if not node:
+        return None, False
+
+    if raw := node.get("dateTime"):
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            return parsed.astimezone(UTC), False
+        except ValueError:
+            return None, False
+
+    if raw := node.get("date"):
+        # A bare date is a local all-day event. Anchor to IST midnight so it
+        # lands on the day the student sees in their calendar.
+        try:
+            parsed = datetime.fromisoformat(raw).replace(tzinfo=IST)
+            return parsed.astimezone(UTC), True
+        except ValueError:
+            return None, False
+
+    return None, False
 
 
-def _parse_event_datetime(dt_obj: dict) -> datetime | None:
-    """Parse Google Calendar event dateTime or date field."""
-    if not dt_obj:
-        return None
-    raw = dt_obj.get("dateTime") or dt_obj.get("date")
-    if not raw:
-        return None
+async def sync_student_calendar(student: dict, lookahead_days: int = LOOKAHEAD_DAYS) -> dict:
+    student_id = str(student["id"])
+    counts = {"events": 0, "deadlines": 0, "errors": 0}
+
+    if not has_scope(student, "calendar"):
+        logger.info("Calendar scope not granted for %s — skipping", student_id)
+        return counts
+
     try:
-        if "T" in raw:
-            dt = datetime.fromisoformat(raw)
-        else:
-            dt = datetime.fromisoformat(raw + "T00:00:00+05:30")  # IST midnight
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc)
-    except ValueError:
-        return None
+        service = await build_service(student, "calendar", "v3")
+    except GoogleAuthError as exc:
+        logger.warning("Calendar auth failed for %s: %s", student_id, exc)
+        counts["errors"] += 1
+        return counts
 
-
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
-async def sync_student_calendar(student: dict, lookahead_days: int = 30) -> int:
-    """
-    Fetch upcoming calendar events for a student.
-    Returns count of items upserted.
-    """
-    tokens = student.get("google_tokens")
-    if not tokens:
-        return 0
-
-    service = build_service(tokens)
-    student_id = student["id"]
-
-    now = datetime.now(timezone.utc)
+    now = now_utc()
     time_max = now + timedelta(days=lookahead_days)
-    count = 0
 
     try:
-        events_resp = (
-            service.events()
+        response = await run_in_threadpool(
+            lambda: service.events()
             .list(
                 calendarId="primary",
                 timeMin=now.isoformat(),
                 timeMax=time_max.isoformat(),
-                singleEvents=True,
+                singleEvents=True,      # expand recurring series into instances
                 orderBy="startTime",
-                maxResults=100,
+                maxResults=MAX_EVENTS,
             )
             .execute()
         )
-    except Exception as e:
-        logger.error(f"Calendar fetch failed for {student_id}: {e}")
-        return 0
+    except Exception as exc:
+        logger.error("Calendar fetch failed for %s: %s", student_id, exc)
+        counts["errors"] += 1
+        return counts
 
-    for event in events_resp.get("items", []):
-        start = _parse_event_datetime(event.get("start", {}))
-        if not start:
+    for event in response.get("items", []):
+        if event.get("status") == "cancelled":
             continue
 
-        summary = event.get("summary", "Untitled Event")
-        description = event.get("description", "")
-        raw = f"{summary}\n{description}".strip()
+        start, is_all_day = _parse_event_time(event.get("start", {}))
+        if start is None:
+            continue
 
-        item_data = {
-            "student_id": student_id,
-            "source": "calendar",
-            "source_id": event["id"],
-            "raw_content": raw,
-            "title": summary,
-            "deadline": start.isoformat(),
-            "metadata": {
-                "location": event.get("location"),
-                "html_link": event.get("htmlLink"),
-                "event_type": event.get("eventType", "default"),
-            },
-        }
+        summary = event.get("summary") or "Untitled event"
+        description = event.get("description") or ""
+        location = event.get("location") or ""
+        event_type = event.get("eventType", "default")
 
-        saved_item = await upsert_item(item_data)
+        # A declined invitation is not the student's commitment.
+        attendee_self = next(
+            (a for a in event.get("attendees", []) if a.get("self")), None
+        )
+        if attendee_self and attendee_self.get("responseStatus") == "declined":
+            continue
 
-        if saved_item:
-            await upsert_deadline({
-                "student_id": student_id,
-                "item_id": saved_item["id"],
-                "title": summary,
-                "due_at": start.isoformat(),
-                "source": "calendar",
-                "confirmed": True,
-                "calendar_event_id": event["id"],
-            })
-            count += 1
+        try:
+            item = await queries.upsert_item(
+                student_id=student_id,
+                source="calendar",
+                source_id=event["id"],
+                raw_content="\n".join(filter(None, [summary, description, location])),
+                title=summary,
+                deadline=start,
+                metadata={
+                    "location": location,
+                    "link": event.get("htmlLink"),
+                    "event_type": event_type,
+                    "all_day": is_all_day,
+                    "organizer": (event.get("organizer") or {}).get("email"),
+                },
+            )
+            counts["events"] += 1
 
-    logger.info(f"Calendar sync done for {student_id}: {count} events")
-    return count
+            if not is_all_day and event_type not in SKIP_DEADLINE_EVENT_TYPES:
+                await queries.upsert_deadline(
+                    student_id=student_id,
+                    dedup_key=f"calendar:{event['id']}",
+                    item_id=str(item["id"]),
+                    title=summary,
+                    due_at=start,
+                    source="calendar",
+                    confirmed=True,     # the student put it there themselves
+                    confidence=1.0,
+                    calendar_event_id=event["id"],
+                )
+                counts["deadlines"] += 1
+        except Exception as exc:
+            logger.error("Saving calendar event %r failed: %s", summary, exc)
+            counts["errors"] += 1
+
+    logger.info("Calendar sync for %s: %s", student_id, counts)
+    return counts

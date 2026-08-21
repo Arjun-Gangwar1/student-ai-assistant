@@ -1,65 +1,70 @@
 """
-Manual sync trigger endpoints — for development / first-run use.
+Manual sync trigger.
+
+Rate-limited: a sync is a burst of Google API calls plus a run of the LLM
+pipeline, so a client that retries in a loop is expensive in both quota and
+money.
 """
 
 import logging
-from fastapi import APIRouter, Request, HTTPException
 
-from app.db.supabase import get_all_students, get_student_by_google_id
-from app.connectors.classroom import sync_student_classroom
-from app.connectors.calendar_conn import sync_student_calendar
-from app.connectors.gmail_conn import sync_student_gmail
-from app.intelligence.pipeline import process_student_items
+from fastapi import APIRouter, HTTPException, status
+
+from app.api.deps import CurrentStudentWithTokens
+from app.config import settings
+from app.utils.ratelimit import RateLimiter
+from app.workers.sync_worker import sync_one_student
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/sync", tags=["sync"])
 
+_sync_limiter = RateLimiter(
+    max_calls=settings.sync_rate_limit_per_hour,
+    window_seconds=3600,
+    name="sync",
+)
+
 
 @router.post("/now")
-async def sync_now(request: Request):
-    """Trigger full sync for the logged-in student immediately."""
-    student_id = request.session.get("student_id")
-    if not student_id:
-        raise HTTPException(status_code=401, detail="Not authenticated")
+async def sync_now(student: CurrentStudentWithTokens):
+    """Pull Classroom, Calendar and (if enabled) Gmail, then run the pipeline."""
+    student_id = str(student["id"])
 
-    students = await get_all_students()
-    student = next((s for s in students if s["id"] == student_id), None)
-    if not student:
-        raise HTTPException(status_code=404, detail="Student not found")
+    allowed, remaining, retry_after = _sync_limiter.check(student_id)
+    if not allowed:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Sync limit reached. Try again in {retry_after // 60 + 1} minutes.",
+            headers={"Retry-After": str(retry_after)},
+        )
 
-    results = {}
+    if not student.get("google_tokens"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Google account is not connected. Sign in again to reconnect.",
+        )
 
-    # Gmail
-    try:
-        gmail_count = await sync_student_gmail(student)
-        results["gmail"] = gmail_count
-    except Exception as e:
-        results["gmail_error"] = str(e)
+    results = await sync_one_student(student)
+    return {"status": "done", "results": results, "syncs_remaining_this_hour": remaining}
 
-    # Classroom
-    try:
-        classroom_counts = await sync_student_classroom(student)
-        results["classroom"] = classroom_counts
-        logger.info(f"Classroom sync: {classroom_counts}")
-    except Exception as e:
-        results["classroom_error"] = str(e)
-        logger.error(f"Classroom sync failed: {e}")
 
-    # Calendar
-    try:
-        calendar_count = await sync_student_calendar(student)
-        results["calendar"] = calendar_count
-        logger.info(f"Calendar sync: {calendar_count} events")
-    except Exception as e:
-        results["calendar_error"] = str(e)
-        logger.error(f"Calendar sync failed: {e}")
+@router.get("/status")
+async def sync_status(student: CurrentStudentWithTokens):
+    """What is connected and what is still waiting to be processed."""
+    from app.db import queries
 
-    # Intelligence pipeline (classify + embed)
-    try:
-        processed = await process_student_items(student)
-        results["processed"] = processed
-    except Exception as e:
-        results["pipeline_error"] = str(e)
-        logger.error(f"Pipeline failed: {e}")
+    student_id = str(student["id"])
+    scopes = student.get("google_scopes") or []
 
-    return {"status": "done", "results": results}
+    return {
+        "google_connected": bool(student.get("google_tokens")),
+        "has_refresh_token": bool((student.get("google_tokens") or {}).get("refresh_token")),
+        "connected_sources": {
+            "classroom": any("classroom" in s for s in scopes),
+            "calendar": any("calendar" in s for s in scopes),
+            "gmail": student.get("gmail_enabled", False) and any("gmail" in s for s in scopes),
+        },
+        "unprocessed_items": await queries.count_unprocessed_items(student_id),
+        "email_count": await queries.count_emails(student_id),
+        "syncs_remaining_this_hour": _sync_limiter.peek(student_id),
+    }

@@ -1,143 +1,182 @@
 """
-Google Classroom connector.
-Scopes used (SENSITIVE only — no CASA audit required):
-  - https://www.googleapis.com/auth/classroom.courses.readonly
-  - https://www.googleapis.com/auth/classroom.coursework.me.readonly
-  - https://www.googleapis.com/auth/classroom.announcements.readonly
+Google Classroom connector — the primary deadline source.
+
+Scopes (all SENSITIVE, no CASA assessment required):
+  classroom.courses.readonly
+  classroom.student-submissions.me.readonly
+  classroom.announcements.readonly
+
+Classroom deadlines are authoritative: they come from the API as structured
+fields, not from an LLM reading prose, so they are stored confirmed.
 """
 
 import logging
-from datetime import datetime, timezone
-from googleapiclient.discovery import build
-from google.oauth2.credentials import Credentials
-from tenacity import retry, stop_after_attempt, wait_exponential
 
-from app.db.supabase import upsert_item, upsert_deadline
+from starlette.concurrency import run_in_threadpool
+
+from app.connectors.google_auth import GoogleAuthError, build_service, has_scope
+from app.db import queries
 from app.utils.date_utils import parse_classroom_date
 
 logger = logging.getLogger(__name__)
 
-CLASSROOM_SCOPES = [
-    "https://www.googleapis.com/auth/classroom.courses.readonly",
-    "https://www.googleapis.com/auth/classroom.student-submissions.me.readonly",
-    "https://www.googleapis.com/auth/classroom.announcements.readonly",
-]
+MAX_ANNOUNCEMENTS_PER_COURSE = 20
+# ACTIVE only: archived courses are last semester's, and their deadlines are all
+# in the past. Fetching them wastes quota and pollutes the radar.
+COURSE_STATES = ["ACTIVE"]
 
 
-def build_service(token_data: dict):
-    creds = Credentials(
-        token=token_data.get("access_token"),
-        refresh_token=token_data.get("refresh_token"),
-        token_uri="https://oauth2.googleapis.com/token",
-        client_id=token_data.get("client_id"),
-        client_secret=token_data.get("client_secret"),
-        scopes=CLASSROOM_SCOPES,
-    )
-    return build("classroom", "v1", credentials=creds, cache_discovery=False)
-
-
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
 async def sync_student_classroom(student: dict) -> dict:
     """
-    Fetch all courses, coursework and announcements for a student.
-    Returns counts of items upserted.
+    Pull courses, coursework and announcements.
+    Returns counts; never raises for a single course's failure.
     """
-    tokens = student.get("google_tokens")
-    if not tokens:
-        logger.warning(f"No tokens for student {student['id']}")
-        return {"assignments": 0, "announcements": 0}
+    student_id = str(student["id"])
+    counts = {"courses": 0, "assignments": 0, "announcements": 0, "errors": 0}
 
-    service = build_service(tokens)
-    student_id = student["id"]
-    counts = {"assignments": 0, "announcements": 0}
+    if not has_scope(student, "classroom"):
+        logger.info("Classroom scope not granted for %s — skipping", student_id)
+        return counts
 
     try:
-        courses_resp = service.courses().list(studentId="me").execute()
-        courses = courses_resp.get("courses", [])
-    except Exception as e:
-        logger.error(f"Failed to fetch courses for {student_id}: {e}")
+        service = await build_service(student, "classroom", "v1")
+    except GoogleAuthError as exc:
+        logger.warning("Classroom auth failed for %s: %s", student_id, exc)
+        counts["errors"] += 1
         return counts
+
+    try:
+        response = await run_in_threadpool(
+            lambda: service.courses()
+            .list(studentId="me", courseStates=COURSE_STATES, pageSize=50)
+            .execute()
+        )
+        courses = response.get("courses", [])
+    except Exception as exc:
+        logger.error("Course list failed for %s: %s", student_id, exc)
+        counts["errors"] += 1
+        return counts
+
+    counts["courses"] = len(courses)
 
     for course in courses:
         course_id = course["id"]
-        course_name = course.get("name", "Unknown Course")
+        course_name = course.get("name", "Unknown course")
 
-        # ── Coursework (assignments) ────────────────────────────────────────
-        try:
-            cw_resp = (
-                service.courses()
-                .courseWork()
-                .list(courseId=course_id, orderBy="dueDate asc")
-                .execute()
-            )
-            for work in cw_resp.get("courseWork", []):
-                raw = (
-                    f"[{course_name}] {work.get('title', '')}\n"
-                    f"{work.get('description', '')}"
-                )
-                item_data = {
-                    "student_id": student_id,
-                    "source": "classroom",
-                    "source_id": work["id"],
-                    "raw_content": raw,
-                    "title": f"{course_name}: {work.get('title', '')}",
-                    "metadata": {
-                        "course_id": course_id,
-                        "course_name": course_name,
-                        "work_type": work.get("workType"),
-                        "max_points": work.get("maxPoints"),
-                    },
-                }
+        counts["assignments"] += await _sync_coursework(
+            service, student_id, course_id, course_name, counts
+        )
+        counts["announcements"] += await _sync_announcements(
+            service, student_id, course_id, course_name, counts
+        )
 
-                # Extract deadline if present
-                due_date = work.get("dueDate")
-                due_time = work.get("dueTime")
-                if due_date:
-                    due_at = parse_classroom_date(due_date, due_time)
-                    item_data["deadline"] = due_at.isoformat()
-
-                saved_item = await upsert_item(item_data)
-
-                # Upsert into deadlines table if due date exists
-                if due_date and saved_item:
-                    await upsert_deadline({
-                        "student_id": student_id,
-                        "item_id": saved_item["id"],
-                        "title": item_data["title"],
-                        "due_at": item_data["deadline"],
-                        "source": "classroom",
-                        "confirmed": True,  # Classroom deadlines are authoritative
-                    })
-                    counts["assignments"] += 1
-
-        except Exception as e:
-            logger.error(f"Coursework fetch failed for course {course_id}: {e}")
-
-        # ── Announcements ───────────────────────────────────────────────────
-        try:
-            ann_resp = (
-                service.courses()
-                .announcements()
-                .list(courseId=course_id, orderBy="updateTime desc", pageSize=20)
-                .execute()
-            )
-            for ann in ann_resp.get("announcements", []):
-                raw = f"[{course_name}] {ann.get('text', '')}"
-                await upsert_item({
-                    "student_id": student_id,
-                    "source": "classroom",
-                    "source_id": ann["id"],
-                    "raw_content": raw,
-                    "title": f"Announcement: {course_name}",
-                    "metadata": {
-                        "course_id": course_id,
-                        "course_name": course_name,
-                        "update_time": ann.get("updateTime"),
-                    },
-                })
-                counts["announcements"] += 1
-        except Exception as e:
-            logger.error(f"Announcements fetch failed for course {course_id}: {e}")
-
-    logger.info(f"Classroom sync done for {student_id}: {counts}")
+    logger.info("Classroom sync for %s: %s", student_id, counts)
     return counts
+
+
+async def _sync_coursework(service, student_id, course_id, course_name, counts) -> int:
+    try:
+        response = await run_in_threadpool(
+            lambda: service.courses()
+            .courseWork()
+            .list(courseId=course_id, orderBy="dueDate desc", pageSize=50)
+            .execute()
+        )
+    except Exception as exc:
+        logger.warning("Coursework fetch failed (%s): %s", course_name, exc)
+        counts["errors"] += 1
+        return 0
+
+    saved = 0
+    for work in response.get("courseWork", []):
+        title = work.get("title", "Untitled")
+        description = work.get("description", "")
+
+        due_at = None
+        if due_date := work.get("dueDate"):
+            try:
+                due_at = parse_classroom_date(due_date, work.get("dueTime"))
+            except ValueError as exc:
+                logger.debug("Unusable dueDate on %r: %s", title, exc)
+
+        try:
+            item = await queries.upsert_item(
+                student_id=student_id,
+                source="classroom",
+                source_id=work["id"],
+                raw_content=f"[{course_name}] {title}\n{description}".strip(),
+                title=f"{course_name}: {title}",
+                deadline=due_at,
+                metadata={
+                    "course_id": course_id,
+                    "course_name": course_name,
+                    "work_type": work.get("workType"),
+                    "max_points": work.get("maxPoints"),
+                    "link": work.get("alternateLink"),
+                },
+            )
+
+            if due_at:
+                await queries.upsert_deadline(
+                    student_id=student_id,
+                    # Keyed on the Classroom id, so re-syncing updates the row
+                    # rather than inserting a duplicate with fresh alert flags.
+                    dedup_key=f"classroom:{work['id']}",
+                    item_id=str(item["id"]),
+                    title=f"{course_name}: {title}",
+                    due_at=due_at,
+                    source="classroom",
+                    confirmed=True,      # structured API field, not an inference
+                    confidence=1.0,
+                )
+                saved += 1
+        except Exception as exc:
+            logger.error("Saving coursework %r failed: %s", title, exc)
+            counts["errors"] += 1
+
+    return saved
+
+
+async def _sync_announcements(service, student_id, course_id, course_name, counts) -> int:
+    try:
+        response = await run_in_threadpool(
+            lambda: service.courses()
+            .announcements()
+            .list(courseId=course_id, orderBy="updateTime desc",
+                  pageSize=MAX_ANNOUNCEMENTS_PER_COURSE)
+            .execute()
+        )
+    except Exception as exc:
+        logger.warning("Announcements fetch failed (%s): %s", course_name, exc)
+        counts["errors"] += 1
+        return 0
+
+    saved = 0
+    for announcement in response.get("announcements", []):
+        text = (announcement.get("text") or "").strip()
+        if not text:
+            continue
+        try:
+            await queries.upsert_item(
+                student_id=student_id,
+                source="classroom",
+                source_id=announcement["id"],
+                raw_content=f"[{course_name}] {text}",
+                # First line as the title: an announcement has no title field,
+                # and "Announcement: Physics" for every one of them is useless
+                # in a list.
+                title=f"{course_name}: {text.splitlines()[0][:120]}",
+                metadata={
+                    "course_id": course_id,
+                    "course_name": course_name,
+                    "type": "announcement",
+                    "update_time": announcement.get("updateTime"),
+                    "link": announcement.get("alternateLink"),
+                },
+            )
+            saved += 1
+        except Exception as exc:
+            logger.error("Saving announcement failed (%s): %s", course_name, exc)
+            counts["errors"] += 1
+
+    return saved

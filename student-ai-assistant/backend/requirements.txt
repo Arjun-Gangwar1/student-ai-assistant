@@ -3,9 +3,8 @@ fastapi==0.115.0
 uvicorn[standard]==0.30.6
 python-multipart==0.0.9
 
-# Database
-supabase==2.7.4
-asyncpg==0.29.0
+# Database — asyncpg direct to Postgres (works against Supabase too)
+asyncpg==0.30.0
 pgvector==0.3.2
 
 # Google APIs
@@ -51,6 +50,7 @@ python-docx>=1.1.0
 
 # Utilities
 python-jose[cryptography]==3.3.0
+cryptography>=43.0.0     # Fernet — encrypts Google OAuth tokens at rest
 passlib[bcrypt]==1.7.4
 python-dotenv==1.0.1
 tenacity==9.0.0          # retry logic
@@ -60,3 +60,6 @@ itsdangerous==2.2.0      # session middleware
 pytest==8.3.3
 pytest-asyncio==0.24.0
 httpx==0.27.2            # test client
+
+# Local Postgres for tests without Docker
+pgserver>=0.1.4

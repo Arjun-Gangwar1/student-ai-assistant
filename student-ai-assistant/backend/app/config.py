@@ -41,6 +41,14 @@ class Settings(BaseSettings):
     gemini_api_key: str = ""
     deepinfra_api_key: str = ""
 
+    # Model ids are configuration, not constants. Groq retired the entire
+    # llama-3.1 family that this project was built on; the hardcoded
+    # "llama-3.1-8b-instant" started returning 404 model_not_found and every
+    # classification and answer failed. Overridable per environment so the next
+    # decommission is an env change rather than a code change.
+    groq_model: str = "openai/gpt-oss-20b"
+    deepinfra_model: str = "meta-llama/Meta-Llama-3.1-8B-Instruct"
+
     # ── Telegram ─────────────────────────────────────────────────────────────
     telegram_bot_token: str = ""
     telegram_webhook_secret: str = ""

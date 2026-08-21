@@ -682,6 +682,10 @@ async def get_deadlines_needing_alert(alert_field: str) -> list[dict]:
                   JOIN students s ON s.id = d.student_id
                  WHERE d.{alert_field} = FALSE
                    AND d.dismissed = FALSE
+                   -- Only confirmed deadlines alert. An LLM-extracted date below
+                   -- the confidence bar is a suggestion; waking a student at 6am
+                   -- for a date the model invented is how trust is lost for good.
+                   AND d.confirmed = TRUE
                    AND s.deleted_at IS NULL
                    AND d.due_at > now()
                    AND d.due_at <= now() + interval '{hours} hours'

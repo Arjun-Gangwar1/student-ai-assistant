@@ -1,42 +1,44 @@
 """
 Structured email API.
 
-GET /api/emails          — paginated list with filters
-GET /api/emails/{id}     — full email with attachments
-GET /api/emails/search   — keyword search across subject + body
+    GET /api/emails            paginated list with filters
+    GET /api/emails/search     full-text over subject + sender + body
+    GET /api/emails/{id}       one email with attachments
+
+Route order matters: /search is declared before /{email_id}, otherwise "search"
+is captured as an id.
 """
 
-from fastapi import APIRouter, HTTPException, Request, Query
+import logging
 from typing import Optional
 
-from app.db.supabase import get_emails, get_email_detail, get_email_count
+from fastapi import APIRouter, HTTPException, Query, status
 
+from app.api.deps import CurrentStudentId
+from app.db import queries
+
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/emails", tags=["emails"])
+
+
+def _serialise(rows: list[dict]) -> list[dict]:
+    for row in rows:
+        row["id"] = str(row["id"])
+        if row.get("item_id"):
+            row["item_id"] = str(row["item_id"])
+    return rows
 
 
 @router.get("")
 async def list_emails(
-    request: Request,
-    limit: int  = Query(10, ge=1, le=100),
+    student_id: CurrentStudentId,
+    limit: int = Query(10, ge=1, le=100),
     offset: int = Query(0, ge=0),
-    date:   Optional[str] = Query(None, description="Filter by date: YYYY-MM-DD"),
-    sender: Optional[str] = Query(None, description="Filter by sender name or email"),
-    subject:Optional[str] = Query(None, description="Keyword in subject line"),
+    date: Optional[str] = Query(None, description="Calendar date in IST: YYYY-MM-DD"),
+    sender: Optional[str] = Query(None, description="Sender name or address, partial match"),
+    subject: Optional[str] = Query(None, description="Keyword in the subject line"),
 ):
-    """
-    Return emails for the logged-in student.
-
-    Examples:
-      GET /api/emails?limit=10
-      GET /api/emails?date=2026-06-01
-      GET /api/emails?sender=ajay
-      GET /api/emails?subject=assignment
-    """
-    student_id = request.session.get("student_id")
-    if not student_id:
-        raise HTTPException(status_code=401, detail="Not authenticated")
-
-    emails = await get_emails(
+    emails = await queries.list_emails(
         student_id=student_id,
         limit=limit,
         offset=offset,
@@ -44,63 +46,40 @@ async def list_emails(
         sender=sender,
         subject=subject,
     )
-    total = await get_email_count(student_id)
-    return {"emails": emails, "total": total, "limit": limit, "offset": offset}
+    return {
+        "emails": _serialise(emails),
+        "total": await queries.count_emails(student_id),
+        "limit": limit,
+        "offset": offset,
+    }
 
 
 @router.get("/search")
 async def search_emails(
-    request: Request,
-    q: str = Query(..., description="Search term across subject + body"),
+    student_id: CurrentStudentId,
+    q: str = Query(..., min_length=1, max_length=200),
     limit: int = Query(10, ge=1, le=50),
 ):
-    """Full-text search across subject and body text."""
-    student_id = request.session.get("student_id")
-    if not student_id:
-        raise HTTPException(status_code=401, detail="Not authenticated")
+    """
+    Full-text search.
 
-    from app.db.supabase import get_supabase
-    db = get_supabase()
-
-    # Search subject (ilike) + body (ilike) — simple but works without FTS index issues
-    subject_res = (
-        db.table("emails")
-        .select("id,subject,sender_name,sender_email,received_at,snippet,has_attachments,is_read")
-        .eq("student_id", student_id)
-        .ilike("subject", f"%{q}%")
-        .order("received_at", desc=True)
-        .limit(limit)
-        .execute()
-    )
-    body_res = (
-        db.table("emails")
-        .select("id,subject,sender_name,sender_email,received_at,snippet,has_attachments,is_read")
-        .eq("student_id", student_id)
-        .ilike("body_text", f"%{q}%")
-        .order("received_at", desc=True)
-        .limit(limit)
-        .execute()
-    )
-
-    # Merge + dedup
-    seen, results = set(), []
-    for row in (subject_res.data or []) + (body_res.data or []):
-        if row["id"] not in seen:
-            seen.add(row["id"])
-            results.append(row)
-
-    results.sort(key=lambda x: x["received_at"], reverse=True)
-    return {"emails": results[:limit], "query": q}
+    Runs against the generated `search_vector` column with a single ranked
+    query, rather than the previous two ILIKE scans merged in Python — which
+    could not rank, and could not use an index.
+    """
+    return {"emails": _serialise(await queries.search_emails(student_id, q, limit)), "query": q}
 
 
 @router.get("/{email_id}")
-async def get_email(request: Request, email_id: str):
-    """Return a single email with full body and all attachments."""
-    student_id = request.session.get("student_id")
-    if not student_id:
-        raise HTTPException(status_code=401, detail="Not authenticated")
+async def get_email(email_id: str, student_id: CurrentStudentId):
+    email = await queries.get_email_detail(email_id, student_id)
+    if email is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Email not found")
 
-    email = await get_email_detail(email_id, student_id)
-    if not email:
-        raise HTTPException(status_code=404, detail="Email not found")
+    email["id"] = str(email["id"])
+    email["student_id"] = str(email["student_id"])
+    if email.get("item_id"):
+        email["item_id"] = str(email["item_id"])
+    for attachment in email.get("attachments", []):
+        attachment["id"] = str(attachment["id"])
     return email

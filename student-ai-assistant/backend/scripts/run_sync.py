@@ -1,49 +1,57 @@
+#!/usr/bin/env python3
 """
-One-shot script to trigger Classroom + Calendar sync for all students.
-Run from backend/ with: python scripts/run_sync.py
+One-shot sync for every student — Classroom, Calendar, Gmail, then the pipeline.
+
+    python scripts/run_sync.py            # all students
+    python scripts/run_sync.py --email a@iitdh.ac.in
 """
+
+import argparse
 import asyncio
+import logging
 import sys
-import os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from pathlib import Path
 
-from app.db.supabase import get_all_students
-from app.connectors.classroom import sync_student_classroom
-from app.connectors.calendar_conn import sync_student_calendar
-from app.intelligence.pipeline import process_student_items
+BACKEND_DIR = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(BACKEND_DIR))
+
+from dotenv import load_dotenv  # noqa: E402
+
+load_dotenv(BACKEND_DIR / ".env")
+
+from app.db import queries  # noqa: E402
+from app.db.pool import close_pool, init_pool  # noqa: E402
+from app.workers.sync_worker import sync_one_student  # noqa: E402
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
 
-async def main():
-    students = await get_all_students()
-    if not students:
-        print("No students found. Login first, then re-run.")
-        return
+async def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--email", help="sync only this student")
+    args = parser.parse_args()
 
-    for student in students:
-        print(f"\n--- Syncing: {student.get('email')} ---")
+    await init_pool()
+    try:
+        students = await queries.get_active_students(with_google_tokens=True)
+        if args.email:
+            students = [s for s in students if s["email"].lower() == args.email.lower()]
 
-        print("  Classroom...", end=" ", flush=True)
-        try:
-            result = await sync_student_classroom(student)
-            print(f"✓  {result}")
-        except Exception as e:
-            print(f"✗  {e}")
+        if not students:
+            print("No matching students. Sign in through the web app first.")
+            return
 
-        print("  Calendar...", end=" ", flush=True)
-        try:
-            count = await sync_student_calendar(student)
-            print(f"✓  {count} events")
-        except Exception as e:
-            print(f"✗  {e}")
+        for student in students:
+            print(f"\n─── {student['email']} ───")
+            if not student.get("google_tokens"):
+                print("  no Google tokens — skipped")
+                continue
 
-        print("  AI pipeline (classify + embed)...", end=" ", flush=True)
-        try:
-            processed = await process_student_items(student)
-            print(f"✓  {processed} items processed")
-        except Exception as e:
-            print(f"✗  {e}")
-
-    print("\nSync complete. Refresh your dashboard.")
+            results = await sync_one_student(student)
+            for source, result in results.items():
+                print(f"  {source:12} {result}")
+    finally:
+        await close_pool()
 
 
 if __name__ == "__main__":

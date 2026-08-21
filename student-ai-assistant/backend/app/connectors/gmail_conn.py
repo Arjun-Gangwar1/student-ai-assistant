@@ -1,453 +1,443 @@
 """
-Gmail connector — structured email sync with attachment extraction.
+Gmail connector — structured email sync with attachment text extraction.
 
-Stores every email in two places:
-  1. `emails` table  — fully structured (sender, date, body, attachments)
-  2. `items`  table  — RAG layer (clean text, embedding, category)
+⚠ RESTRICTED SCOPE. `gmail.readonly` is classified restricted by Google.
+Serving more than 100 lifetime users requires OAuth verification plus an annual
+CASA security assessment (~$540/yr). Gated behind GMAIL_ENABLED and a per-student
+consent flag so that obligation is a deliberate choice. See docs/PRIVACY.md.
 
-Attachment text (PDF, docx, txt, md) also gets its own `items` row
-so the bot can find "the PDF Arjun sent about Assignment 3".
+Each message is written to two places:
+  emails  — the structured record a student can browse and filter
+  items   — the RAG layer: cleaned text, embedding, category
 
-Scope required: https://www.googleapis.com/auth/gmail.readonly
+Attachments with extractable text get their own `items` row, so a question like
+"what was in the PDF the prof sent about Assignment 3" can retrieve the PDF's
+contents rather than just the covering email.
 """
 
 import base64
 import io
 import logging
 import re
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 
 from bs4 import BeautifulSoup
-from googleapiclient.discovery import build
-from google.oauth2.credentials import Credentials
-from tenacity import retry, stop_after_attempt, wait_exponential
+from starlette.concurrency import run_in_threadpool
 
-from app.db.supabase import upsert_item, upsert_email, upsert_email_attachment
+from app.config import settings
+from app.connectors.google_auth import GoogleAuthError, build_service, has_scope
+from app.db import queries
 
 logger = logging.getLogger(__name__)
 
-GMAIL_SCOPES    = ["https://www.googleapis.com/auth/gmail.readonly"]
-LOOKBACK_DAYS   = 30
-MAX_EMAILS      = 50
-MAX_ATTACH_BYTES = 5 * 1024 * 1024   # 5 MB per attachment
+DEFAULT_LOOKBACK_DAYS = 30
+MAX_EMAILS_PER_SYNC = 50
+MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024
+MAX_BODY_CHARS = 8000
+MAX_EXTRACTED_CHARS = 6000
 
-# Mime types we can extract text from
 TEXT_MIME_TYPES = {
     "application/pdf",
-    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",  # docx
-    "application/msword",            # doc (best-effort)
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/msword",
     "text/plain",
     "text/markdown",
     "text/csv",
 }
-IMAGE_MIME_PREFIX = "image/"
+TEXT_EXTENSIONS = (".pdf", ".docx", ".doc", ".txt", ".md", ".csv")
 
-# Links that look like shared documents / academic resources
 DOC_LINK_RE = re.compile(
     r"https?://(?:docs\.google\.com|drive\.google\.com|github\.com|"
-    r"classroom\.google\.com|forms\.gle|bit\.ly|[a-z0-9-]+\.iitdh\.ac\.in)[^\s\"'>)]*",
-    re.I,
+    r"classroom\.google\.com|forms\.gle|[a-z0-9-]+\.iitdh\.ac\.in)[^\s\"'>)\]]*",
+    re.IGNORECASE,
 )
+SENDER_RE = re.compile(r'^(?:"?([^"<]*)"?\s*)?<([^>]+)>$')
 
-SENDER_RE = re.compile(r'^(?:"?([^"<]+)"?\s*)?<([^>]+)>$')
+# Unicode spaces and invisible characters. Mail from web composers is full of
+# these; left in, they fragment tokens and wreck both search and embeddings.
+UNICODE_SPACES = re.compile(r"[   -   　]")
+INVISIBLE_CHARS = re.compile(r"[­​-‏‪-‮⁠﻿͏]")
 
 
-# ─── Helpers ──────────────────────────────────────────────────────────────────
+# ─── Parsing helpers ─────────────────────────────────────────────────────────
 
 def _parse_sender(raw: str) -> tuple[str, str]:
     """'Arjun <a@b.com>' → ('Arjun', 'a@b.com')"""
-    raw = raw.strip()
-    m = SENDER_RE.match(raw)
-    if m:
-        name  = (m.group(1) or "").strip().strip('"')
-        email = (m.group(2) or "").strip().lower()
-        return name, email
-    # plain email address with no angle brackets
+    raw = (raw or "").strip()
+    if match := SENDER_RE.match(raw):
+        name = (match.group(1) or "").strip().strip('"')
+        email = (match.group(2) or "").strip().lower()
+        return name or email.split("@")[0], email
     if "@" in raw:
         return raw.split("@")[0].replace(".", " ").title(), raw.lower()
     return raw, ""
 
 
-def _get_header(headers: list, name: str) -> str:
-    for h in headers:
-        if h["name"].lower() == name.lower():
-            return h["value"]
-    return ""
+def _get_header(headers: list[dict], name: str) -> str:
+    lowered = name.lower()
+    return next((h["value"] for h in headers if h.get("name", "").lower() == lowered), "")
 
 
-def _extract_text_from_html(html: str) -> str:
-    """Strip HTML tags and decode entities cleanly, preserving word spacing."""
-    soup = BeautifulSoup(html, "lxml")
-    for tag in soup(["script", "style", "head", "meta", "link", "img"]):
-        tag.decompose()
-    # separator=" " ensures adjacent text nodes are separated (prevents word merging)
-    text = soup.get_text(separator=" ", strip=True)
-    # Collapse multiple spaces → one, but keep single newlines
-    text = re.sub(r" {2,}", " ", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
-
-
-def _strip_quoted_replies(text: str) -> str:
-    """Remove classic > quoted lines and 'On ... wrote:' trailers."""
-    lines = text.splitlines()
-    clean = []
-    for line in lines:
-        stripped = line.strip()
-        if stripped.startswith(">"):
-            break
-        if re.match(r"^On .{10,80} wrote:$", stripped):
-            break
-        clean.append(line)
-    return "\n".join(clean).strip()
-
-
-def _decode_part_data(data: str) -> str:
-    """Base64url-decode a Gmail body part, always returning str."""
+def _decode_part(data: str) -> str:
+    """Base64url-decode a Gmail body part, tolerating missing padding."""
+    if not data:
+        return ""
     try:
-        # Gmail uses URL-safe base64; strip whitespace before decoding
-        raw = base64.urlsafe_b64decode(data.replace(" ", "").replace("\n", "") + "==")
-        return raw.decode("utf-8", errors="replace")
+        cleaned = data.replace("-", "+").replace("_", "/").strip()
+        padded = cleaned + "=" * (-len(cleaned) % 4)
+        return base64.b64decode(padded).decode("utf-8", errors="replace")
     except Exception:
         return ""
 
 
+def _html_to_text(html: str) -> str:
+    soup = BeautifulSoup(html, "lxml")
+    for tag in soup(["script", "style", "head", "meta", "link", "img"]):
+        tag.decompose()
+    # separator=" " prevents adjacent block elements merging into "wordword".
+    return soup.get_text(separator=" ", strip=True)
+
+
 def _extract_body_parts(payload: dict) -> tuple[str, str]:
-    """
-    Recursively extract (plain_text, html_text) from a Gmail payload.
-    Handles 'text/plain; charset=utf-8' style MIME types correctly.
-    """
+    """Recursively collect (plain, html) from a MIME tree."""
     mime = payload.get("mimeType", "")
 
-    # Use startswith to handle "text/plain; charset=utf-8" etc.
     if mime.startswith("text/plain"):
-        data = payload.get("body", {}).get("data", "")
-        if data:
-            return _decode_part_data(data), ""
-
+        return _decode_part(payload.get("body", {}).get("data", "")), ""
     if mime.startswith("text/html"):
-        data = payload.get("body", {}).get("data", "")
-        if data:
-            return "", _decode_part_data(data)
+        return "", _decode_part(payload.get("body", {}).get("data", ""))
 
     if mime.startswith("multipart"):
-        plain_parts, html_parts = [], []
+        plains, htmls = [], []
         for part in payload.get("parts", []):
-            p, h = _extract_body_parts(part)
-            if p: plain_parts.append(p)
-            if h: html_parts.append(h)
-        return "\n".join(plain_parts), "\n".join(html_parts)
+            plain, html = _extract_body_parts(part)
+            if plain:
+                plains.append(plain)
+            if html:
+                htmls.append(html)
+        return "\n".join(plains), "\n".join(htmls)
 
     return "", ""
 
 
-def _clean_body(payload: dict, snippet: str) -> str:
-    """Return the cleanest possible text body from a Gmail message payload."""
+def _strip_quoted_replies(text: str) -> str:
+    """Drop '>' quoted blocks and 'On ... wrote:' trailers."""
+    lines = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(">"):
+            break
+        if re.match(r"^On .{10,120}\s+wrote:$", stripped):
+            break
+        if re.match(r"^-{2,}\s*Forwarded message\s*-{2,}$", stripped, re.I):
+            break
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
+def _normalise(text: str) -> str:
+    text = UNICODE_SPACES.sub(" ", text)
+    text = INVISIBLE_CHARS.sub("", text)
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+def clean_body(payload: dict, snippet: str) -> str:
+    """Best available plain text for a message."""
     plain, html = _extract_body_parts(payload)
+    stripped = plain.strip()
 
-    plain_stripped = plain.strip()
-    # Ignore garbled plain text (bytes repr from broken email generators)
-    plain_ok = plain_stripped and not plain_stripped.startswith(("b'", 'b"'))
-
-    if plain_ok:
+    # Some generators emit a Python bytes repr into text/plain; prefer the HTML
+    # part when that happens.
+    if stripped and not stripped.startswith(("b'", 'b"')):
         text = _strip_quoted_replies(plain)
     elif html.strip():
-        text = _strip_quoted_replies(_extract_text_from_html(html))
+        text = _strip_quoted_replies(_html_to_text(html))
     else:
-        text = snippet  # last resort: Gmail snippet
+        text = snippet
 
-    # Convert unicode non-standard spaces (figure space, nbsp, etc.) → regular space
-    text = re.sub(r"[   -    　]", " ", text)
-    # Remove zero-width / invisible / directional control chars
-    text = re.sub(r"[­​-‏‪-‮﻿͏⁠]", "", text)
-    # Collapse runs of spaces, clean up newlines
-    text = re.sub(r" {2,}", " ", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()[:4000]
+    return _normalise(text)[:MAX_BODY_CHARS]
 
 
-def _extract_doc_links(body: str) -> list[str]:
-    """Find academic/document links mentioned in the email body."""
-    return list(dict.fromkeys(DOC_LINK_RE.findall(body)))  # dedup, preserve order
+def extract_doc_links(body: str) -> list[str]:
+    return list(dict.fromkeys(DOC_LINK_RE.findall(body)))
 
 
-def _collect_attachment_parts(payload: dict, parts_out: list) -> None:
-    """Recursively find all attachment parts in a Gmail payload."""
-    mime = payload.get("mimeType", "")
-    filename = payload.get("filename", "")
-    attach_id = payload.get("body", {}).get("attachmentId")
-
-    if filename and attach_id:
-        parts_out.append({
-            "filename":     filename,
-            "mime_type":    mime,
-            "size_bytes":   payload.get("body", {}).get("size", 0),
-            "attachment_id": attach_id,
+def _collect_attachments(payload: dict, out: list[dict]) -> None:
+    if (filename := payload.get("filename")) and (
+        attachment_id := payload.get("body", {}).get("attachmentId")
+    ):
+        out.append({
+            "filename": filename,
+            "mime_type": payload.get("mimeType", ""),
+            "size_bytes": payload.get("body", {}).get("size", 0),
+            "attachment_id": attachment_id,
         })
-
     for part in payload.get("parts", []):
-        _collect_attachment_parts(part, parts_out)
+        _collect_attachments(part, out)
 
 
-def _extract_text_from_bytes(data: bytes, mime_type: str, filename: str) -> str:
-    """Extract text from attachment bytes based on mime type."""
+def extract_text_from_bytes(data: bytes, mime_type: str, filename: str) -> str:
+    """Pull text out of an attachment. Returns '' when unsupported."""
+    lower = filename.lower()
     try:
-        if mime_type == "application/pdf" or filename.lower().endswith(".pdf"):
+        if mime_type == "application/pdf" or lower.endswith(".pdf"):
             import pdfplumber
+
             with pdfplumber.open(io.BytesIO(data)) as pdf:
-                pages = [p.extract_text() or "" for p in pdf.pages[:20]]
-            return "\n".join(pages).strip()[:6000]
+                pages = [page.extract_text() or "" for page in pdf.pages[:20]]
+            return _normalise("\n".join(pages))[:MAX_EXTRACTED_CHARS]
 
-        if (mime_type in (
-                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                "application/msword",
-            ) or filename.lower().endswith((".docx", ".doc"))):
+        if lower.endswith((".docx", ".doc")) or mime_type in (
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "application/msword",
+        ):
             from docx import Document
-            doc = Document(io.BytesIO(data))
-            return "\n".join(p.text for p in doc.paragraphs if p.text.strip())[:6000]
 
-        if mime_type in ("text/plain", "text/markdown", "text/csv") or \
-                filename.lower().endswith((".txt", ".md", ".csv")):
-            return data.decode("utf-8", errors="ignore")[:6000]
+            document = Document(io.BytesIO(data))
+            paragraphs = [p.text for p in document.paragraphs if p.text.strip()]
+            # Tables carry timetables and exam schedules — the highest-value
+            # content in a campus attachment.
+            for table in document.tables:
+                for row in table.rows:
+                    cells = [c.text.strip() for c in row.cells if c.text.strip()]
+                    if cells:
+                        paragraphs.append(" | ".join(cells))
+            return _normalise("\n".join(paragraphs))[:MAX_EXTRACTED_CHARS]
 
-    except Exception as e:
-        logger.warning(f"Attachment text extraction failed ({filename}): {e}")
+        if mime_type in ("text/plain", "text/markdown", "text/csv") or lower.endswith(
+            (".txt", ".md", ".csv")
+        ):
+            return _normalise(data.decode("utf-8", errors="ignore"))[:MAX_EXTRACTED_CHARS]
+
+    except Exception as exc:
+        logger.warning("Attachment text extraction failed (%s): %s", filename, exc)
 
     return ""
 
 
-def build_service(token_data: dict):
-    creds = Credentials(
-        token=token_data.get("access_token"),
-        refresh_token=token_data.get("refresh_token"),
-        token_uri="https://oauth2.googleapis.com/token",
-        client_id=token_data.get("client_id"),
-        client_secret=token_data.get("client_secret"),
-        scopes=token_data.get("scopes", []) + GMAIL_SCOPES,
-    )
-    return build("gmail", "v1", credentials=creds, cache_discovery=False)
+# ─── Sync ────────────────────────────────────────────────────────────────────
+
+def gmail_allowed_for(student: dict) -> tuple[bool, str]:
+    """
+    Whether Gmail may be synced for this student, and why not if not.
+
+    Three gates, all of which must pass: the deployment flag, an optional
+    allowlist for piloting before verification, and the student's own consent.
+    """
+    if not settings.gmail_enabled:
+        return False, "GMAIL_ENABLED is false"
+    if not student.get("gmail_enabled"):
+        return False, "student has not enabled Gmail"
+    if not has_scope(student, "gmail"):
+        return False, "gmail scope not granted"
+
+    allowlist = settings.gmail_allowlist_emails
+    if allowlist and (student.get("email") or "").lower() not in allowlist:
+        return False, "not in GMAIL_ALLOWLIST"
+
+    return True, ""
 
 
-# ─── Main sync ────────────────────────────────────────────────────────────────
+async def sync_student_gmail(student: dict, max_emails: int = MAX_EMAILS_PER_SYNC) -> dict:
+    student_id = str(student["id"])
+    counts = {"emails": 0, "attachments": 0, "errors": 0, "skipped": None}
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
-async def sync_student_gmail(student: dict, max_emails: int = MAX_EMAILS) -> int:
-    tokens = student.get("google_tokens")
-    if not tokens:
-        return 0
-
-    stored_scopes = tokens.get("scopes", [])
-    if not any("gmail" in s for s in stored_scopes):
-        logger.info(f"Gmail scope missing for {student['id']} — skipping")
-        return 0
+    allowed, reason = gmail_allowed_for(student)
+    if not allowed:
+        counts["skipped"] = reason
+        logger.debug("Gmail sync skipped for %s: %s", student_id, reason)
+        return counts
 
     try:
-        service = build_service(tokens)
-    except Exception as e:
-        logger.error(f"Gmail service build failed for {student['id']}: {e}")
-        return 0
+        service = await build_service(student, "gmail", "v1")
+    except GoogleAuthError as exc:
+        logger.warning("Gmail auth failed for %s: %s", student_id, exc)
+        counts["errors"] += 1
+        return counts
 
-    student_id = student["id"]
-    count = 0
+    # Incremental: fetch only what arrived since the newest message held. The
+    # previous version re-fetched a fixed 30-day window every three minutes,
+    # re-downloading and re-parsing the same messages indefinitely.
+    latest = await queries.latest_email_timestamp(student_id)
+    if latest:
+        after = latest - timedelta(hours=1)     # small overlap for clock skew
+    else:
+        after = datetime.now(timezone.utc) - timedelta(days=DEFAULT_LOOKBACK_DAYS)
 
-    after_ts = int(
-        (datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS)).timestamp()
-    )
     query = (
-        f"after:{after_ts} "
-        "-category:promotions -category:social "
-        "-in:spam -in:trash"
+        f"after:{int(after.timestamp())} "
+        "-category:promotions -category:social -in:spam -in:trash"
     )
 
     try:
-        result = (
-            service.users()
+        listing = await run_in_threadpool(
+            lambda: service.users()
             .messages()
             .list(userId="me", q=query, maxResults=max_emails)
             .execute()
         )
-        messages = result.get("messages", [])
-    except Exception as e:
-        logger.error(f"Gmail list failed for {student_id}: {e}")
-        return 0
+        message_refs = listing.get("messages", [])
+    except Exception as exc:
+        logger.error("Gmail list failed for %s: %s", student_id, exc)
+        counts["errors"] += 1
+        return counts
 
-    for msg_ref in messages:
+    for ref in message_refs:
         try:
-            msg = (
-                service.users()
+            message = await run_in_threadpool(
+                lambda mid=ref["id"]: service.users()
                 .messages()
-                .get(userId="me", id=msg_ref["id"], format="full")
+                .get(userId="me", id=mid, format="full")
                 .execute()
             )
-            count += await _process_message(service, student_id, msg)
-        except Exception as e:
-            logger.warning(f"Failed to process message {msg_ref['id']}: {e}")
+            attachments = await _process_message(service, student_id, message)
+            counts["emails"] += 1
+            counts["attachments"] += attachments
+        except Exception as exc:
+            logger.warning("Processing message %s failed: %s", ref["id"], exc)
+            counts["errors"] += 1
 
-    logger.info(f"Gmail sync complete for {student_id}: {count} emails upserted")
-    return count
+    logger.info("Gmail sync for %s: %s", student_id, counts)
+    return counts
 
 
-async def _process_message(service, student_id: str, msg: dict) -> int:
-    """Process one Gmail message: store in emails + items tables."""
-    headers    = msg.get("payload", {}).get("headers", [])
-    message_id = msg["id"]
-    thread_id  = msg.get("threadId", "")
-    snippet    = msg.get("snippet", "")
-    label_ids  = msg.get("labelIds", [])
-    is_read    = "UNREAD" not in label_ids
+async def _process_message(service, student_id: str, message: dict) -> int:
+    payload = message.get("payload", {})
+    headers = payload.get("headers", [])
+    message_id = message["id"]
 
-    subject      = _get_header(headers, "Subject") or "(no subject)"
-    raw_sender   = _get_header(headers, "From")
-    raw_to       = _get_header(headers, "To")
-    sender_name, sender_email = _parse_sender(raw_sender)
-
-    # Recipients (To: field)
+    subject = _get_header(headers, "Subject") or "(no subject)"
+    sender_name, sender_email = _parse_sender(_get_header(headers, "From"))
+    raw_to = _get_header(headers, "To")
     recipients = [r.strip() for r in raw_to.split(",") if r.strip()] if raw_to else []
 
-    # Parse received timestamp
-    internal_ms  = int(msg.get("internalDate", 0))
-    received_at  = datetime.fromtimestamp(internal_ms / 1000, tz=timezone.utc)
-
-    # Clean body
-    body_text = _clean_body(msg.get("payload", {}), snippet)
-
-    # Extract academic/document links from body
-    doc_links = _extract_doc_links(body_text)
-
-    # Collect attachment metadata
-    attach_parts: list[dict] = []
-    _collect_attachment_parts(msg.get("payload", {}), attach_parts)
-    has_attachments  = len(attach_parts) > 0
-    attachment_count = len(attach_parts) + len(doc_links)
-
-    # ── 1. Upsert into items (RAG layer) first to get item_id ────────────
-    # Embed subject + sender + body for semantic search
-    embed_text_for_rag = f"Subject: {subject}\nFrom: {sender_name} <{sender_email}>\n\n{body_text[:1000]}"
-
-    item = await upsert_item({
-        "student_id": student_id,
-        "source":     "gmail",
-        "source_id":  message_id,
-        "raw_content": body_text,
-        "title":      subject,
-        "metadata": {
-            "sender_name":    sender_name,
-            "sender_email":   sender_email,
-            "received_at":    received_at.isoformat(),
-            "thread_id":      thread_id,
-            "labels":         label_ids,
-            "has_attachments": has_attachments,
-            "doc_links":      doc_links[:5],   # store up to 5 doc links
-        },
-    })
-    item_id = item["id"]
-
-    # ── 2. Upsert into emails (structured store) ──────────────────────────
-    email_row = await upsert_email({
-        "student_id":       student_id,
-        "item_id":          item_id,
-        "message_id":       message_id,
-        "thread_id":        thread_id,
-        "subject":          subject,
-        "sender_name":      sender_name,
-        "sender_email":     sender_email,
-        "recipients":       recipients,
-        "received_at":      received_at.isoformat(),
-        "body_text":        body_text,
-        "snippet":          snippet,
-        "labels":           label_ids,
-        "has_attachments":  has_attachments,
-        "attachment_count": attachment_count,
-        "is_read":          is_read,
-    })
-    email_id = email_row["id"]
-
-    # ── 3. Process file attachments ───────────────────────────────────────
-    for part in attach_parts:
-        await _process_file_attachment(
-            service, student_id, email_id, item_id,
-            message_id, subject, sender_name, part
-        )
-
-    # ── 4. Store doc links as link-type attachments ───────────────────────
-    for url in doc_links:
-        fname = url.split("/")[-1][:80] or "link"
-        await upsert_email_attachment({
-            "email_id":        email_id,
-            "student_id":      student_id,
-            "filename":        fname,
-            "mime_type":       "text/uri-list",
-            "attachment_type": "link",
-            "url":             url,
-            "extracted_text":  f"Link from email: {subject}\nURL: {url}",
-        })
-
-    return 1
-
-
-async def _process_file_attachment(
-    service, student_id: str, email_id: str, parent_item_id: str,
-    message_id: str, subject: str, sender_name: str, part: dict
-) -> None:
-    filename   = part["filename"]
-    mime_type  = part["mime_type"]
-    size_bytes = part["size_bytes"]
-
-    is_image    = mime_type.startswith(IMAGE_MIME_PREFIX)
-    can_extract = (
-        mime_type in TEXT_MIME_TYPES or
-        filename.lower().endswith((".pdf", ".docx", ".doc", ".txt", ".md", ".csv"))
+    label_ids = message.get("labelIds", [])
+    snippet = message.get("snippet", "")
+    received_at = datetime.fromtimestamp(
+        int(message.get("internalDate", 0)) / 1000, tz=timezone.utc
     )
 
-    extracted_text = ""
+    body_text = clean_body(payload, snippet)
+    doc_links = extract_doc_links(body_text)
 
-    # Download and extract text (skip images and oversized files)
-    if can_extract and size_bytes <= MAX_ATTACH_BYTES and size_bytes > 0:
+    attachment_parts: list[dict] = []
+    _collect_attachments(payload, attachment_parts)
+
+    # 1. items row — what RAG retrieves against
+    item = await queries.upsert_item(
+        student_id=student_id,
+        source="gmail",
+        source_id=message_id,
+        raw_content=f"From: {sender_name} <{sender_email}>\nSubject: {subject}\n\n{body_text}",
+        title=subject,
+        metadata={
+            "sender_name": sender_name,
+            "sender_email": sender_email,
+            "thread_id": message.get("threadId", ""),
+            "labels": label_ids,
+            "has_attachments": bool(attachment_parts),
+            "doc_links": doc_links[:5],
+        },
+    )
+    item_id = str(item["id"])
+
+    # 2. emails row — what the inbox UI browses
+    email_row = await queries.upsert_email(
+        student_id=student_id,
+        item_id=item_id,
+        message_id=message_id,
+        thread_id=message.get("threadId", ""),
+        subject=subject,
+        sender_name=sender_name,
+        sender_email=sender_email,
+        recipients=recipients,
+        received_at=received_at,
+        body_text=body_text,
+        snippet=snippet,
+        labels=label_ids,
+        has_attachments=bool(attachment_parts),
+        attachment_count=len(attachment_parts) + len(doc_links),
+        is_read="UNREAD" not in label_ids,
+    )
+    email_id = str(email_row["id"])
+
+    processed = 0
+    for part in attachment_parts:
         try:
-            attach_data = (
-                service.users()
-                .messages()
-                .attachments()
-                .get(userId="me", messageId=message_id, id=part["attachment_id"])
-                .execute()
+            await _process_attachment(
+                service, student_id, email_id, message_id, subject, sender_name, part
             )
-            raw_bytes = base64.urlsafe_b64decode(
-                attach_data.get("data", "") + "=="
-            )
-            extracted_text = _extract_text_from_bytes(raw_bytes, mime_type, filename)
-        except Exception as e:
-            logger.warning(f"Attachment download failed ({filename}): {e}")
+            processed += 1
+        except Exception as exc:
+            logger.warning("Attachment %s failed: %s", part.get("filename"), exc)
 
-    attachment_type = "image" if is_image else "file"
+    # 3. Document links recorded as link-type attachments
+    for url in doc_links:
+        await queries.upsert_email_attachment(
+            email_id=email_id,
+            student_id=student_id,
+            filename=(url.rstrip("/").split("/")[-1][:80] or "link"),
+            mime_type="text/uri-list",
+            attachment_type="link",
+            url=url,
+            extracted_text=f"Link shared in email {subject!r}: {url}",
+        )
 
-    att_row = await upsert_email_attachment({
-        "email_id":        email_id,
-        "student_id":      student_id,
-        "filename":        filename,
-        "mime_type":       mime_type,
-        "size_bytes":      size_bytes,
-        "extracted_text":  extracted_text,
-        "attachment_type": attachment_type,
-    })
+    return processed
 
-    # Create items row for attachments with extracted text (for RAG)
+
+async def _process_attachment(
+    service, student_id, email_id, message_id, subject, sender_name, part
+) -> None:
+    filename = part["filename"]
+    mime_type = part["mime_type"]
+    size_bytes = part["size_bytes"]
+
+    is_image = mime_type.startswith("image/")
+    can_extract = mime_type in TEXT_MIME_TYPES or filename.lower().endswith(TEXT_EXTENSIONS)
+
+    extracted_text = ""
+    if can_extract and 0 < size_bytes <= MAX_ATTACHMENT_BYTES:
+        blob = await run_in_threadpool(
+            lambda: service.users()
+            .messages()
+            .attachments()
+            .get(userId="me", messageId=message_id, id=part["attachment_id"])
+            .execute()
+        )
+        raw = blob.get("data", "")
+        padded = raw.replace("-", "+").replace("_", "/")
+        padded += "=" * (-len(padded) % 4)
+        extracted_text = extract_text_from_bytes(
+            base64.b64decode(padded), mime_type, filename
+        )
+
+    attachment = await queries.upsert_email_attachment(
+        email_id=email_id,
+        student_id=student_id,
+        filename=filename,
+        mime_type=mime_type,
+        size_bytes=size_bytes,
+        extracted_text=extracted_text,
+        attachment_type="image" if is_image else "file",
+    )
+
+    # Only attachments with real text become searchable items — an items row
+    # with no content is retrieval noise.
     if extracted_text.strip():
-        att_item = await upsert_item({
-            "student_id": student_id,
-            "source":     "gmail_attachment",
-            "source_id":  f"{message_id}_{filename}",
-            "raw_content": extracted_text,
-            "title":      f"[Attachment] {filename}",
-            "metadata": {
-                "email_id":       email_id,
-                "parent_item_id": parent_item_id,
-                "filename":       filename,
-                "mime_type":      mime_type,
-                "sender_name":    sender_name,
+        item = await queries.upsert_item(
+            student_id=student_id,
+            source="gmail_attachment",
+            source_id=f"{message_id}:{filename}",
+            raw_content=extracted_text,
+            title=f"[Attachment] {filename}",
+            metadata={
+                "email_id": email_id,
+                "filename": filename,
+                "mime_type": mime_type,
+                "sender_name": sender_name,
                 "parent_subject": subject,
             },
-        })
-        # Link items row back to attachment
-        from app.db.supabase import get_supabase
-        db = get_supabase()
-        db.table("email_attachments").update({"item_id": att_item["id"]}).eq("id", att_row["id"]).execute()
+        )
+        await queries.link_attachment_item(str(attachment["id"]), str(item["id"]))
