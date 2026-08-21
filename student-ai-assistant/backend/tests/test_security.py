@@ -56,7 +56,12 @@ class TestTokenEncryption:
             crypto._fernet = original
 
     def test_redact_never_reveals_the_secret(self):
-        assert "WW8vODNgcin" not in redact("gsk_WW8vODNgcin3wvWTH5")
+        # Synthetic value. Never use a fragment of a real credential as test
+        # data — it ends up in git history, which is exactly what this file
+        # exists to prevent.
+        secret = "gsk_FAKEKEY0123456789abcdefghijklmnop"
+        assert secret[4:] not in redact(secret)
+        assert redact(secret).startswith("gsk_")
         assert redact(None) == "<empty>"
 
 
