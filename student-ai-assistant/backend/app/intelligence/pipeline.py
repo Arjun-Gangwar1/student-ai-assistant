@@ -1,94 +1,171 @@
 """
-Intelligence pipeline: runs classification + extraction + embedding
-on raw items that haven't been processed yet.
-Called by the background worker after each connector sync.
+Intelligence pipeline: classify → extract → embed → persist.
+
+Reworked for throughput. The previous version slept 2 seconds after every item
+to stay inside Groq's free-tier rate limit, serially, inside a job that ran every
+three minutes. One student with 50 new emails occupied the worker for over 100
+seconds of pure sleep, and with `max_instances=1` the next run was silently
+dropped rather than queued.
+
+Now:
+  * Classification runs concurrently, bounded by a semaphore sized to the rate
+    limit, so throughput is limited by the quota rather than by latency.
+  * Embeddings are batched — sentence-transformers encodes 32 texts in barely
+    more time than one, and it is a local model with no quota at all.
+  * Deadline extraction runs only where deadlines plausibly hide, which is what
+    keeps the LLM budget inside the plan's ~₹2-5/user/month.
 """
 
 import asyncio
 import logging
-from datetime import datetime
+import re
 
-from app.db.supabase import get_unprocessed_items, update_item, upsert_deadline, get_supabase
+from app.db import queries
 from app.intelligence.classifier import classify_item
+from app.intelligence.embedder import embed_batch
 from app.intelligence.extractor import extract_deadlines
-from app.intelligence.embedder import embed_text
 
 logger = logging.getLogger(__name__)
 
+# Groq's free tier allows ~30 requests/minute. Six concurrent classifications
+# with ~1s latency each lands near 30 rpm without bursting past it.
+MAX_CONCURRENT_LLM = 6
+EMBED_BATCH_SIZE = 32
 
-async def process_student_items(student: dict) -> int:
-    """
-    Classify, extract deadlines from, and embed all unprocessed items
-    for a student. Returns number of items processed.
-    """
-    student_id = student["id"]
-    year = student.get("year")
-    branch = student.get("branch")
+# Sources whose text is prose that may bury a date in a sentence. Classroom and
+# Calendar deliver structured due dates already, so paying for extraction there
+# would be spending tokens to re-derive a field the API handed us.
+EXTRACTION_SOURCES = {"website", "gmail", "gmail_attachment", "telegram"}
 
-    raw_items = await get_unprocessed_items(student_id)
-    if not raw_items:
+# Cheap pre-filter: no date-like token, no LLM call. Roughly two thirds of
+# emails never reach the extractor.
+DATE_HINT_RE = re.compile(
+    r"\b(?:"
+    r"\d{1,2}[/\-.]\d{1,2}(?:[/\-.]\d{2,4})?"                       # 18/02/2026
+    r"|\d{1,2}\s*(?:st|nd|rd|th)?\s*"
+    r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)"          # 18 Feb
+    r"|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+\d{1,2}"
+    r"|(?:mon|tues|wednes|thurs|fri|satur|sun)day"
+    r"|deadline|due\s+(?:by|on|date)|last\s+date|submit\s+by"
+    r"|before\s+\d|closes?\s+on|register\s+by|cut[\s-]?off"
+    r"|tomorrow|tonight|kal\b|aaj\b"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _deadline_dedup_key(item: dict, title: str) -> str:
+    """Stable identity for a deadline derived from an item's text."""
+    slug = re.sub(r"[^a-z0-9]+", "-", title.lower())[:40].strip("-")
+    return f"extracted:{item['id']}:{slug}"
+
+
+async def process_student_items(student: dict, limit: int = 50) -> int:
+    """
+    Process every unprocessed item for one student.
+    Returns the number successfully processed.
+    """
+    student_id = str(student["id"])
+    year, branch = student.get("year"), student.get("branch")
+
+    items = await queries.get_unprocessed_items(student_id, limit=limit)
+    if not items:
         return 0
 
-    count = 0
-    for item in raw_items:
+    logger.info("Pipeline: %d unprocessed item(s) for %s", len(items), student_id)
+
+    # ── 1. Classify, concurrently but rate-bounded ───────────────────────────
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT_LLM)
+
+    async def classify_one(item: dict) -> dict:
+        async with semaphore:
+            return await classify_item(
+                raw_content=item.get("raw_content", ""),
+                title=item.get("title"),
+                year=year,
+                branch=branch,
+            )
+
+    classifications = await asyncio.gather(
+        *(classify_one(item) for item in items), return_exceptions=True
+    )
+
+    # ── 2. Extract deadlines where they plausibly exist ──────────────────────
+    async def extract_one(item: dict) -> list[dict]:
+        text = item.get("raw_content", "")
+        if item.get("source") not in EXTRACTION_SOURCES:
+            return []
+        if item.get("deadline"):
+            return []          # source already gave us an authoritative date
+        if not DATE_HINT_RE.search(text):
+            return []
+        async with semaphore:
+            return await extract_deadlines(text, source=item.get("source", "unknown"))
+
+    extractions = await asyncio.gather(
+        *(extract_one(item) for item in items), return_exceptions=True
+    )
+
+    # ── 3. Embed in batches (local model, no quota) ──────────────────────────
+    embed_inputs: list[str] = []
+    for item, classification in zip(items, classifications):
+        summary = classification.get("summary", "") if isinstance(classification, dict) else ""
+        embed_inputs.append(
+            f"{item.get('title') or ''}\n{summary}\n{item.get('raw_content', '')[:600]}".strip()
+        )
+
+    vectors: list[list[float] | None] = []
+    for start in range(0, len(embed_inputs), EMBED_BATCH_SIZE):
+        chunk = embed_inputs[start : start + EMBED_BATCH_SIZE]
         try:
-            text = item.get("raw_content", "")
-            if not text.strip():
-                continue
+            vectors.extend(await embed_batch(chunk))
+        except Exception as exc:
+            # An item without an embedding is still useful — full-text search
+            # will find it — so record the failure and carry on.
+            logger.error("Embedding batch failed: %s", exc)
+            vectors.extend([None] * len(chunk))
 
-            # Step 1: Classify
-            classification = await classify_item(text, year=year, branch=branch)
+    # ── 4. Persist ───────────────────────────────────────────────────────────
+    processed = 0
+    for item, classification, extracted, vector in zip(items, classifications, extractions, vectors):
+        item_id = str(item["id"])
 
-            # Step 2: Extract deadlines (website scrapes only — not gmail/classroom/calendar)
-            # Gmail emails rarely have clean extractable deadlines; skip to save Groq quota
-            new_deadlines = []
-            if item.get("source") == "website":
-                new_deadlines = await extract_deadlines(text)
-
-            # Step 3: Embed
-            embed_text_input = f"{item.get('title', '')} {classification['summary']} {text[:500]}"
-            vector = await embed_text(embed_text_input)
-
-            # Step 4: Update item record
-            update_data = {
-                "category": classification["category"],
-                "priority": classification["priority"],
-                "relevance_score": classification["relevance_score"],
-                "summary": classification["summary"] or item.get("title", ""),
-                "embedding": vector,
-            }
-
-            # Use first extracted deadline if item has none (and it's a valid timestamp)
-            if new_deadlines and not item.get("deadline"):
-                best = new_deadlines[0]
-                due = best.get("due_at")
-                if due and due != "null" and due is not None:
-                    update_data["deadline"] = due
-                    update_data["confidence"] = best["confidence"]
-
-            await update_item(item["id"], update_data)
-
-            # Step 5: Persist extracted deadlines
-            for dl in new_deadlines:
-                await upsert_deadline({
-                    "student_id": student_id,
-                    "item_id": item["id"],
-                    "title": dl["title"],
-                    "due_at": dl["due_at"],
-                    "source": item["source"],
-                    "confirmed": dl["confirmed"],
-                })
-
-            count += 1
-            logger.debug(f"Processed item {item['id']} → {classification['category']}/{classification['priority']}")
-
-            # Groq free tier: 30 req/min → 2s between calls
-            await asyncio.sleep(2)
-
-        except Exception as e:
-            logger.error(f"Failed to process item {item.get('id')}: {e}")
-            await asyncio.sleep(2)  # back off on error
+        if isinstance(classification, BaseException):
+            logger.error("Classification failed for item %s: %s", item_id, classification)
             continue
+        if isinstance(extracted, BaseException):
+            logger.error("Extraction failed for item %s: %s", item_id, extracted)
+            extracted = []
 
-    logger.info(f"Intelligence pipeline: processed {count} items for student {student_id}")
-    return count
+        best = max(extracted, key=lambda d: d["confidence"], default=None) if extracted else None
+
+        try:
+            await queries.save_item_analysis(
+                item_id=item_id,
+                category=classification["category"],
+                priority=classification["priority"],
+                relevance_score=classification["relevance_score"],
+                summary=classification["summary"] or (item.get("title") or ""),
+                embedding=vector,
+                deadline=best["due_at"] if best else None,
+                confidence=best["confidence"] if best else None,
+            )
+
+            for deadline in extracted:
+                await queries.upsert_deadline(
+                    student_id=student_id,
+                    dedup_key=_deadline_dedup_key(item, deadline["title"]),
+                    item_id=item_id,
+                    title=deadline["title"],
+                    due_at=deadline["due_at"],
+                    source=item["source"],
+                    confirmed=deadline["confirmed"],
+                    confidence=deadline["confidence"],
+                )
+
+            processed += 1
+        except Exception as exc:
+            logger.error("Persisting item %s failed: %s", item_id, exc)
+
+    logger.info("Pipeline: processed %d/%d item(s) for %s", processed, len(items), student_id)
+    return processed

@@ -1,88 +1,131 @@
 """
-Classifies raw item text into category, priority, relevance score.
-Uses Groq Llama-3.1-8B with JSON mode for structured output.
+Classifies an item into category, priority and relevance.
+
+Runs on every ingested item, so it is the pipeline's dominant LLM cost. Keep the
+prompt short and the input capped.
 """
 
 import logging
-from datetime import datetime
 
 from app.intelligence.llm_client import llm, parse_json_response
+from app.utils.date_utils import now_ist
 
 logger = logging.getLogger(__name__)
 
-CLASSIFY_SYSTEM = """You are a classifier for Indian college student communications at IIT Dharwad.
-Classify each item accurately. Return ONLY valid JSON — no explanation."""
+CATEGORIES = {
+    "academic", "admin", "event", "transport",
+    "mess", "placement", "hostel", "general",
+}
+PRIORITIES = {"HIGH", "MEDIUM", "LOW"}
+
+CLASSIFY_SYSTEM = (
+    "You classify communications received by students at IIT Dharwad, an Indian "
+    "engineering institute. You return only valid JSON, with no commentary."
+)
 
 CLASSIFY_PROMPT = """Classify this student communication.
 
-Student profile: Year {year}, Branch {branch}
-Today's date: {today}
+Student: year {year}, branch {branch}
+Today: {today} (IST)
 
-Categories (pick ONE):
-- academic   : assignments, exams, lectures, syllabus, grades
-- admin      : fees, registration, official notices, circulars
-- event      : workshops, hackathons, seminars, cultural, sports
-- transport  : bus, shuttle, transport schedule changes
-- mess       : mess menu, food, canteen
-- placement  : internships, jobs, PPO, campus recruitment
-- hostel     : hostel notices, warden, room, maintenance
-- general    : everything else
+category — exactly one of:
+  academic   assignments, exams, quizzes, lectures, syllabus, grades
+  admin      fees, registration, official circulars, documents
+  event      workshops, hackathons, fests, seminars, sports
+  transport  bus and shuttle schedules
+  mess       mess menu, food, canteen
+  placement  internships, jobs, PPOs, campus recruitment
+  hostel     hostel notices, warden, rooms, maintenance
+  general    anything else, including newsletters and automated mail
 
-Priority (pick ONE based on urgency + relevance):
-- HIGH   : deadline within 48h OR extremely relevant to student
-- MEDIUM : deadline within 7 days OR moderately relevant
-- LOW    : low urgency or low relevance
+priority — exactly one of:
+  HIGH    needs action within 48h, or is highly specific to this student
+  MEDIUM  needs action within a week, or is moderately relevant
+  LOW     informational, or not relevant to this student's year/branch
 
-Text to classify:
+relevance — 0.0 to 1.0, how much this matters to THIS student specifically.
+  A notice for a different year or branch scores below 0.3 regardless of urgency.
+
+one_line_summary — under 100 characters, stating the concrete action or fact.
+  Good: "Assignment 3 (Linear Algebra) due Friday 6pm on Classroom"
+  Bad:  "This email is about an assignment"
+
+Text:
 {text}
 
-Return ONLY this JSON:
-{{
-  "category": "academic",
-  "priority": "HIGH",
-  "relevance": 0.9,
-  "one_line_summary": "Assignment 3 due in 2 days for Linear Algebra"
-}}"""
+Return only:
+{{"category":"academic","priority":"HIGH","relevance":0.9,"one_line_summary":"..."}}"""
+
+# Applied when the LLM is unreachable or returns nonsense. Deliberately low
+# priority and mid relevance: an unclassified item should never jump the queue
+# in a digest on the strength of a failed call.
+FALLBACK = {
+    "category": "general",
+    "priority": "LOW",
+    "relevance_score": 0.4,
+    "summary": "",
+}
 
 
 async def classify_item(
     raw_content: str,
+    title: str | None = None,
     year: int | None = None,
     branch: str | None = None,
 ) -> dict:
-    """
-    Returns dict with keys: category, priority, relevance, one_line_summary.
-    Defaults to safe values on failure.
-    """
+    """Returns {category, priority, relevance_score, summary}, never raises."""
+    text = f"{title}\n\n{raw_content}" if title else raw_content
+    text = text.strip()
+    if not text:
+        return dict(FALLBACK)
+
     prompt = CLASSIFY_PROMPT.format(
         year=year or "unknown",
         branch=branch or "unknown",
-        today=datetime.now().strftime("%Y-%m-%d"),
-        text=raw_content[:1500],  # cap to avoid token overflow
+        today=now_ist().strftime("%A, %d %B %Y"),
+        text=text[:1500],
     )
 
     try:
-        raw = llm().chat(
+        raw = await llm().chat(
             messages=[
                 {"role": "system", "content": CLASSIFY_SYSTEM},
                 {"role": "user", "content": prompt},
             ],
             json_mode=True,
             temperature=0.0,
+            max_tokens=200,
         )
-        result = parse_json_response(raw)
+    except Exception as exc:
+        logger.error("Classification call failed: %s", exc)
+        return dict(FALLBACK)
 
-        return {
-            "category": result.get("category", "general"),
-            "priority": result.get("priority", "LOW"),
-            "relevance_score": float(result.get("relevance", 0.5)),
-            "summary": result.get("one_line_summary", ""),
-        }
-    except Exception as e:
-        logger.error(f"Classification failed: {e}")
-        return {
-            "category": "general",
-            "priority": "LOW",
-            "relevance_score": 0.3,
-            "summary": "",
-        }
+    result = parse_json_response(raw)
+    if not result:
+        return dict(FALLBACK)
+
+    # Validate rather than trust: an out-of-vocabulary category would violate
+    # the CHECK constraint and fail the write for the whole item.
+    category = str(result.get("category", "")).lower().strip()
+    if category not in CATEGORIES:
+        logger.debug("Unknown category %r from model, using 'general'", category)
+        category = "general"
+
+    priority = str(result.get("priority", "")).upper().strip()
+    if priority not in PRIORITIES:
+        priority = "LOW"
+
+    try:
+        relevance = float(result.get("relevance", 0.5))
+    except (TypeError, ValueError):
+        relevance = 0.5
+    relevance = min(1.0, max(0.0, relevance))
+
+    summary = str(result.get("one_line_summary", "") or "").strip()[:300]
+
+    return {
+        "category": category,
+        "priority": priority,
+        "relevance_score": relevance,
+        "summary": summary,
+    }
