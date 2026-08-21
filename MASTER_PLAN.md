@@ -21,7 +21,14 @@
 | `research.md` | Deep India-first strategic analysis (most valuable doc) |
 | `StudentAI_Complete_Project_Guide.docx` | Full guide doc |
 
-**Current state: Zero code. 100% planning documents.** Everything below is the build plan.
+> ⚠️ **This section is superseded.** As of **2026-08-21** the project is roughly
+> 70% of Phase 1 built and verified running end to end. See
+> [`PROJECT_STATUS.md`](PROJECT_STATUS.md) for the current audit and
+> [`student-ai-assistant/README.md`](student-ai-assistant/README.md) for how to run it.
+>
+> The line below was accurate on 2026-06-10 and is kept for history.
+
+~~**Current state: Zero code. 100% planning documents.** Everything below is the build plan.~~
 
 ---
 
@@ -443,46 +450,46 @@ async def build_morning_digest(student: Student) -> str:
 
 ```
 WEEK 1–2 (Foundation)
-  [ ] Supabase project setup, schema migration
-  [ ] Google Cloud project, OAuth consent screen (sensitive scopes)
-  [ ] FastAPI backend scaffold, Supabase client, auth middleware
-  [ ] Telegram Bot setup (@BotFather), webhook endpoint
+  [x] Supabase project setup, schema migration   ← now plain Postgres via DATABASE_URL
+  [x] Google Cloud project, OAuth consent screen (sensitive scopes)
+  [x] FastAPI backend scaffold, Supabase client, auth middleware
+  [x] Telegram Bot setup (@BotFather), webhook endpoint
 
 WEEK 3–4 (Connectors)
-  [ ] Google Classroom connector (courses, coursework, announcements)
-  [ ] Google Calendar connector (events, deadlines)
-  [ ] APScheduler polling jobs (every 2h)
-  [ ] Raw data → items table pipeline
+  [x] Google Classroom connector (courses, coursework, announcements)
+  [x] Google Calendar connector (events, deadlines)
+  [x] APScheduler polling jobs (every 2h)
+  [x] Raw data → items table pipeline
 
 WEEK 5–6 (Intelligence)
-  [ ] Groq classifier + deadline extractor (JSON mode)
-  [ ] text-embedding-3-small embedder → pgvector
-  [ ] Priority scoring logic
-  [ ] Deadline deduplication (by source_id)
+  [x] Groq classifier + deadline extractor (JSON mode)
+  [x] embedder → pgvector                        ← local all-mpnet-base-v2, not OpenAI
+  [x] Priority scoring logic
+  [x] Deadline deduplication                     ← by (student_id, dedup_key)
 
 WEEK 7–8 (Output Layer)
-  [ ] Telegram Bot: morning digest (daily cron 7:30 AM)
-  [ ] Telegram Bot: deadline alerts (48h, 24h, 6h)
-  [ ] RAG Q&A engine (hybrid retrieval + Groq generation)
-  [ ] Telegram /ask command handler
+  [x] Telegram Bot: morning digest (daily cron 7:30 AM)
+  [x] Telegram Bot: deadline alerts (48h, 24h, 6h)
+  [x] RAG Q&A engine (hybrid retrieval + Groq generation)
+  [x] Telegram /ask command handler
 
 WEEK 9–10 (Frontend)
-  [ ] Next.js PWA: login with Google
-  [ ] Deadline radar page
-  [ ] Chat Q&A interface
-  [ ] Mobile-optimized, installable
+  [x] Next.js PWA: login with Google
+  [x] Deadline radar page
+  [x] Chat Q&A interface
+  [x] Mobile-optimized, installable
 
 WEEK 11–12 (Polish + Pilot)
-  [ ] Demo data seeder
-  [ ] Error handling, retry logic, rate limiting
-  [ ] Trust features: source citation, low-confidence flagging
-  [ ] Deploy: Vercel + Railway + Supabase
+  [x] Demo data seeder
+  [x] Error handling, retry logic, rate limiting
+  [x] Trust features: source citation, low-confidence flagging
+  [ ] Deploy: Vercel + Railway + Supabase        ← NEXT: needs a new database
   [ ] Onboard 10 IIT Dharwad beta users
 
 WEEK 13–20 (Phase 2 — after retention proven)
-  [ ] College website scraper (IITdh portal, VOAL)
+  [x] College website scraper (IITdh portal)     ← built early, ahead of plan
   [ ] PDF parsing with Gemini 2.0 Flash-Lite
-  [ ] Gmail integration (accept CASA cost now)
+  [ ] Gmail integration (accept CASA cost now)   ← BUILT EARLY; see docs/PRIVACY.md
   [ ] OAuth verification (sensitive scopes)
   [ ] Freemium tier split
 ```
@@ -494,8 +501,17 @@ WEEK 13–20 (Phase 2 — after retention proven)
 1. **Wrong deadline = sev-1 bug.** Never silently create a calendar event from low-confidence extraction (`confidence < 0.8`). Always show source + a one-tap confirm. Trust is the entire product.
 
 2. **Never call Gmail API before Phase 2.** The $540/yr CASA audit can take weeks at the wrong time — budget it for when you have paying users or proven retention.
+   > **Overridden 2026-08-21, deliberately.** Gmail is built and enabled: it is
+   > where campus information actually arrives, and a radar that cannot see email
+   > misses most of what a student needs. The obligation is accepted and
+   > documented in `docs/PRIVACY.md`. `GMAIL_ALLOWLIST` restricts it to named
+   > pilot users until verification, and `GMAIL_ENABLED=false` reverts entirely.
 
 3. **Provider abstraction for LLMs from Day 1.** Groq had 90% of engineers move to NVIDIA in Dec 2025. Keep a `llm_client.py` wrapper so you can swap to DeepInfra / Together / Cerebras in one place.
+   > **This happened.** By 2026-08-21 Groq had retired the entire `llama-3.1`
+   > family; the hardcoded `llama-3.1-8b-instant` returned `404 model_not_found`
+   > and every classification and answer failed. Model ids are now configuration
+   > (`GROQ_MODEL`), not constants. The abstraction earned itself.
 
 4. **<100 users = run unverified "In Production".** Do not waste weeks on OAuth verification before you know the product retains users.
 

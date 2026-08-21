@@ -1,7 +1,15 @@
-version: "3.9"
+# Local development stack.
+#
+# The previous file mounted only 001_initial.sql into the Postgres init
+# directory, so a fresh local database silently lacked the emails tables and
+# every search function. Migrations are applied by scripts/migrate.py instead —
+# one code path for local and Supabase alike, rather than two that drift.
+#
+#   docker compose up -d db redis
+#   cd backend && python scripts/migrate.py
+#   uvicorn app.main:app --reload
 
 services:
-  # ── Local Postgres with pgvector (mirrors Supabase schema) ──────────────────
   db:
     image: pgvector/pgvector:pg16
     environment:
@@ -12,14 +20,12 @@ services:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
-      - ./backend/app/db/migrations/001_initial.sql:/docker-entrypoint-initdb.d/001_initial.sql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U studentai"]
+      test: ["CMD-SHELL", "pg_isready -U studentai -d studentai"]
       interval: 5s
       timeout: 5s
       retries: 10
 
-  # ── Redis (task queue + session) ────────────────────────────────────────────
   redis:
     image: redis:7-alpine
     ports:
@@ -29,12 +35,15 @@ services:
       interval: 5s
       retries: 10
 
-  # ── FastAPI backend ─────────────────────────────────────────────────────────
   backend:
     build:
       context: ./backend
-      dockerfile: Dockerfile
     env_file: ./backend/.env
+    environment:
+      # Overrides .env: inside the compose network the database is "db", not
+      # localhost. Without this the container would dial its own loopback.
+      DATABASE_URL: postgresql://studentai:studentai@db:5432/studentai
+      REDIS_URL: redis://redis:6379
     ports:
       - "8000:8000"
     depends_on:
@@ -44,7 +53,12 @@ services:
         condition: service_healthy
     volumes:
       - ./backend:/app
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+      # Keep the ~420MB sentence-transformers download across rebuilds.
+      - model-cache:/root/.cache/huggingface
+    command: >
+      sh -c "python scripts/migrate.py &&
+             uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
 
 volumes:
   pgdata:
+  model-cache:

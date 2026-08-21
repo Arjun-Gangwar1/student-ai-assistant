@@ -164,32 +164,56 @@ Anyone with a student UUID can read that student's deadlines, inbox, **and run R
 
 ## 4. What Remains
 
-### Tier 0 — Unblock (nothing works until these are done)
-1. Create a new Supabase project (or move to a durable Postgres)
-2. Consolidated, ordered, idempotent migration set + a runner that handles `plpgsql` bodies
-3. Rotate **every** leaked credential
-4. `git init` + first commit
+### ✅ Tier 0 — Unblock — **DONE 2026-08-21**
+- [x] Consolidated, ordered, idempotent migrations + a runner that handles `plpgsql` bodies
+- [x] `git init`, `.gitignore`, secrets scrubbed **before** the first commit, scanner wired in
+- [x] Moved off PostgREST to asyncpg — local Postgres and Supabase are now one code path
+- [ ] **Rotate every leaked credential** — see `docs/SECURITY_ROTATION.md` *(only you can do this)*
+- [ ] **Provision a durable database** — local via `docker compose`, or a new Supabase project
 
-### Tier 1 — Correctness & safety
-5. Session-based authorization on all data endpoints (kill the IDOR)
-6. `on_conflict` dedup for deadlines
-7. `telegram_link_token` column + working `/start` link flow
-8. Fix FTS so hybrid retrieval is genuinely hybrid
-9. Encrypt `google_tokens` at rest; persist refreshed tokens
-10. Truthful privacy copy + a real privacy policy page
+### ✅ Tier 1 — Correctness & safety — **DONE**
+- [x] Session-derived identity on every data endpoint; IDOR closed and regression-tested
+- [x] Deadline dedup on `(student_id, dedup_key)`; alert flags reset only when `due_at` moves
+- [x] `telegram_link_token` column + working `/start <token>` flow + UI to issue it
+- [x] Hybrid retrieval genuinely runs both halves (`websearch_to_tsquery` + OR fallback, RRF)
+- [x] `google_tokens` Fernet-encrypted at rest; refreshed tokens persisted
+- [x] Truthful landing copy + a real `/privacy` notice + `docs/PRIVACY.md`
+- [x] Unconfirmed deadlines never alert (was violating Non-Negotiable Rule #1)
 
 ### Tier 2 — Ship-readiness (MASTER_PLAN weeks 11–12)
-11. Test suite (currently zero)
-12. Rate limiting, retry/backoff audit, Sentry
-13. Emails UI page in the frontend
-14. Move sync to RQ workers; batch embeddings
-15. Deploy: Vercel + Railway + Supabase
-16. `docs/api.md`
-17. Onboard 10 IITdh beta users; instrument the §14 metrics (W4 retention, digest open rate)
+- [x] Test suite — **114 tests** against real Postgres, none before
+- [x] Rate limiting on chat and sync; Telegram markdown fallback; structured error handling
+- [x] Emails UI page
+- [x] Batched embeddings, bounded-concurrency pipeline, incremental Gmail sync
+- [x] `docs/api.md` (generated from the live OpenAPI spec)
+- [ ] Error monitoring (Sentry) and CI
+- [ ] Deploy: Vercel + Railway + a database
+- [ ] Onboard ~10 IITdh beta users; instrument the §14 metrics
 
 ### Tier 3 — Phase 2 (only after the ≥40% W4 retention gate)
-18. Shared `global_items` for campus-wide content
-19. Gemini multimodal for circular/mess-menu images
-20. Telegram group listener
-21. OAuth verification + CASA audit (mandatory if Gmail stays)
-22. Feedback-loop training data pipeline (the moat)
+- [ ] Shared `global_items` for campus-wide content (see the note in `website.py`)
+- [ ] Gemini multimodal for circular and mess-menu images
+- [ ] Telegram group listener
+- [ ] OAuth verification + CASA assessment — **required before ~100 users** since Gmail stays
+- [ ] Feedback-loop training pipeline (the moat; `extraction_feedback` is already collecting)
+
+---
+
+## 5. Verified Working (2026-08-21)
+
+Run against a real Postgres and live Groq, not inspected on paper:
+
+| Check | Result |
+|---|---|
+| Migrations from an empty schema | ✅ both apply, idempotent on re-run |
+| Test suite | ✅ 114 passed |
+| App boot | ✅ pool, 7 scheduled jobs, embedding model (768-dim), 0 errors |
+| Unauthenticated access to 16 endpoints | ✅ all 401 |
+| Cross-student reads by id | ✅ 404, no data |
+| RAG retrieval across students | ✅ scoped, no leakage |
+| Forged / tampered session cookie | ✅ rejected |
+| Deleted account's valid session | ✅ 401 immediately |
+| Deadline radar with priorities | ✅ correct ordering and time-remaining |
+| Q&A grounding | ✅ cites sources, states time left, handles Hinglish |
+| Q&A refusal | ✅ declines to invent an exam that does not exist |
+| DPDP export + delete | ✅ full export; tokens destroyed at once |
