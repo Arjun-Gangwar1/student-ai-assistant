@@ -9,7 +9,19 @@ later from a Google email.
 """
 
 import logging
+import os
 import secrets
+
+# oauthlib rejects a token response whose scope list differs from what was
+# requested. Google legitimately returns a *subset*: it drops scopes whose API
+# is not enabled in the project, and drops any the user declined at the consent
+# screen. Both are normal, and this app depends on the second one — Gmail is
+# advertised as optional, so a student who declines it must still be able to
+# sign in with Classroom and Calendar alone.
+#
+# Without this, any partial grant raises "Scope has changed from … to …" and the
+# login fails outright. Set before google_auth_oauthlib imports oauthlib.
+os.environ.setdefault("OAUTHLIB_RELAX_TOKEN_SCOPE", "1")
 
 import httpx
 from fastapi import APIRouter, HTTPException, Request, Response, status
@@ -67,9 +79,31 @@ def create_flow(scopes: list[str] | None = None) -> Flow:
     )
 
 
-def _fetch_token_sync(flow: Flow, code: str) -> None:
-    """google-auth's token exchange is synchronous; keep it off the event loop."""
+def _fetch_token_sync(flow: Flow, code: str) -> dict:
+    """
+    Exchange the code for tokens. Returns Google's raw token response.
+
+    The raw response matters: its `scope` field is the authoritative list of
+    what was actually granted. `credentials.scopes` is *not* — with
+    OAUTHLIB_RELAX_TOKEN_SCOPE enabled it simply echoes what we asked for, so
+    trusting it records scopes the token does not carry, and every API call then
+    fails with ACCESS_TOKEN_SCOPE_INSUFFICIENT while the database claims access
+    was granted.
+    """
     flow.fetch_token(code=code)
+    return dict(flow.oauth2session.token or {})
+
+
+def _granted_scopes(token_response: dict, credentials) -> list[str]:
+    """Authoritative granted scopes, preferring Google's own answer."""
+    raw = token_response.get("scope")
+    if isinstance(raw, str) and raw.strip():
+        return raw.split()
+    if isinstance(raw, (list, tuple)) and raw:
+        return list(raw)
+    # Only reached if Google omits `scope`, which it does not in practice.
+    logger.warning("Token response carried no scope field; falling back to requested scopes")
+    return list(credentials.scopes or [])
 
 
 @router.get("/login")
@@ -111,11 +145,14 @@ async def callback(request: Request, code: str | None = None, state: str | None 
 
     try:
         flow = create_flow()
-        await run_in_threadpool(_fetch_token_sync, flow, code)
+        token_response = await run_in_threadpool(_fetch_token_sync, flow, code)
         credentials = flow.credentials
     except Exception as exc:
         logger.error("Token exchange failed: %s", exc)
-        raise HTTPException(status.HTTP_502_BAD_GATEWAY, "Could not complete Google sign-in.")
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY,
+            f"Could not complete Google sign-in: {exc}",
+        )
 
     try:
         async with httpx.AsyncClient(timeout=15) as client:
@@ -133,7 +170,23 @@ async def callback(request: Request, code: str | None = None, state: str | None 
     if not google_id:
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, "Google did not return a user id.")
 
-    granted = list(credentials.scopes or [])
+    granted = _granted_scopes(token_response, credentials)
+
+    # Google drops scopes whose API is not enabled in the Cloud project, and
+    # does so silently — no error, just a consent screen missing those
+    # permissions. The symptom is an app that signs in perfectly and then finds
+    # no data, which is a miserable thing to debug. Name it here instead.
+    missing = [s for s in requested_scopes() if s not in granted and s != "openid"]
+    if missing:
+        logger.warning(
+            "NOT granted: %s\n"
+            "  Either the user declined them, or the owning API is disabled in "
+            "Google Cloud (APIs & Services → Library → enable Google Classroom API, "
+            "Google Calendar API, Gmail API), in which case Google removes the scope "
+            "from the consent screen without reporting an error.",
+            ", ".join(s.rsplit("/", 1)[-1] for s in missing),
+        )
+
     student = await queries.upsert_student(
         google_id=google_id,
         email=user_info.get("email", ""),

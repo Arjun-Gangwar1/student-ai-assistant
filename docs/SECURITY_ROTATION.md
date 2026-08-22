@@ -167,65 +167,162 @@ startup, so a token change is picked up on the next deploy. Locally you use
 
 ---
 
-## Step 4 — Google OAuth client secret (7 min) — *the subtle one*
+## Step 4 — Google OAuth client (15 min) — *the fiddly one*
 
-**What it is.** Half of the credential pair that proves to Google "this app is Student AI
-Assistant". The client **ID** is public by design — it appears in browser URLs. The client
-**secret** is what proves the request is genuinely from your server.
+**What it is.** A pair of values that prove to Google "this app is Student AI Assistant". The
+client **ID** is public by design — it appears in browser URLs. The client **secret** proves
+the request genuinely came from your server.
 
-**Why it matters, and why it is the least obvious.** With your client ID *and* secret, someone
-can stand up a site that produces a Google consent screen showing **your app's name**. A
-student sees a legitimate-looking Google sign-in for an app they were told to use, approves
-it, and the attacker receives tokens for that student's account. Because your scope list
-includes `gmail.readonly`, that consent grants access to their mail.
+**Why it matters most subtly.** With your client ID *and* secret, someone can stand up a site
+that shows a Google consent screen carrying **your app's name**. A student sees a legitimate
+sign-in for an app they were told to use, approves it, and the attacker receives tokens for
+their account. Because the scope list includes `gmail.readonly`, that consent hands over their
+mail. It is a phishing capability wearing your name.
 
-That is a phishing capability wearing your name. It is why this one matters even though
-nothing is deployed yet.
+---
 
-**Do it:**
+### 4a. First, find the right project
 
-1. Go to <https://console.cloud.google.com>
-2. Select your project (top-left project picker)
-3. **APIs & Services → Credentials**
-4. Under **OAuth 2.0 Client IDs**, open the one whose ID starts `247279631192-…` and ends
-   `…j67n82.apps.googleusercontent.com`
-5. On the right, find **Client secrets** → **Add secret**
-6. Copy the new secret, then **disable and delete the old one**
+Your app is configured for project number **`247279631192`** — that is the digit string before
+the first dash in `GOOGLE_CLIENT_ID`.
 
-> Newer Google Cloud consoles let you hold two secrets briefly so a live app can roll over
-> without downtime. If yours only offers **Reset Secret**, that is fine — it invalidates the
-> old one immediately, which costs nothing with no users.
+At <https://console.cloud.google.com>, click the project picker at the top-left. If the picker
+shows a different number (for example `424319561492`, "Project 1"), you are in the wrong
+project and its credentials are unrelated to this app.
 
-7. Replace `GOOGLE_CLIENT_SECRET=` in `.env`. **Leave `GOOGLE_CLIENT_ID` unchanged** — it is
-   not secret and does not rotate.
+Search the picker for `247279631192`. Then:
 
-**While you are in there, check two things that will bite you at deploy time:**
+- **Found it** → open it and go to **4b**.
+- **Not there** → it belongs to a different Google account, or it was deleted. Sign in with the
+  account you originally used, or go to **4c** and create a fresh client. Creating a new one is
+  completely fine; nothing is lost.
 
-- **Authorised redirect URIs** must contain exactly `http://localhost:8000/api/auth/callback`,
-  matching `GOOGLE_REDIRECT_URI` in `.env` character for character. Google compares these as
-  exact strings — a trailing slash is a different URI. When you deploy, add the production
-  callback as a second entry.
-- **OAuth consent screen → Publishing status.** While "Testing", only accounts on the **Test
-  users** list can sign in, capped at 100. Add your own email there now, or your first real
-  login attempt will fail with `access_denied` and look like a code bug.
+---
 
-**Verify:**
+### 4b. If you found the original project — rotate the secret
+
+1. **APIs & Services → Credentials**
+2. Under **OAuth 2.0 Client IDs**, open the entry whose ID starts `247279631192-…`
+3. Check **Application type** at the top. It must be **Web application**.
+   - If it says **Desktop**, stop and use **4c** instead — see the box below for why.
+4. Under **Client secrets**, choose **Add secret** (newer consoles) or **Reset secret** (older).
+5. Copy the new secret, then delete the old one.
+6. Replace `GOOGLE_CLIENT_SECRET=` in `.env`. **Leave `GOOGLE_CLIENT_ID` alone** — it is not
+   secret and does not rotate.
+
+Now jump to **4d** to verify the surrounding configuration.
+
+---
+
+### 4c. Creating a new OAuth client
+
+> #### Why the type matters
+>
+> **Desktop** clients are *public clients*: Google assumes the secret ships inside an
+> application a user can decompile, so it is not treated as confidential, and you cannot
+> configure custom redirect URIs.
+>
+> **Web application** clients are *confidential clients*: the secret lives on a server nobody
+> else can read, and you register exactly which redirect URIs are allowed. That is what this
+> app is — a FastAPI backend. The code confirms it: `CLIENT_CONFIG` in `app/api/auth.py` uses
+> the `"web"` key, and the flow redirects to a fixed URL on your own server.
+>
+> Using a Desktop client here would be the wrong security model even where it happens to work.
+
+**Step 1 — Enable the APIs you will call.** Easy to forget, and its failure looks like a code
+bug: *"Google Classroom API has not been used in project … before or it is disabled."*
+
+**APIs & Services → Library**, then search for and **Enable** each of:
+
+- `Google Classroom API`
+- `Google Calendar API`
+- `Gmail API`
+
+**Step 2 — Configure the consent screen** (only needed once per project).
+
+**APIs & Services → OAuth consent screen**:
+
+| Field | Value |
+|---|---|
+| User type | **External** |
+| App name | `Student AI Assistant` — this is what students see, so make it recognisable |
+| User support email | your IITDh address |
+| Developer contact | your IITDh address |
+| Authorised domain | leave blank until you have a real domain |
+
+On the **Scopes** step you may add scopes now or leave it — the app requests what it needs at
+runtime. Adding them here is required later for verification.
+
+On the **Test users** step, **add your own email address**. While publishing status is
+"Testing", only listed accounts can sign in, capped at 100. Skip this and your first sign-in
+fails with `access_denied`, which looks exactly like a broken app.
+
+**Step 3 — Create the client.**
+
+1. **APIs & Services → Credentials → Create credentials → OAuth client ID**
+2. **Application type: Web application** ← the important choice
+3. Name: `studentai-backend`
+4. Under **Authorised redirect URIs**, click **Add URI** and enter *exactly*:
+
+   ```
+   http://localhost:8000/api/auth/callback
+   ```
+
+   Google matches this as a literal string. A trailing slash, `127.0.0.1` instead of
+   `localhost`, or `https` instead of `http` are all different URIs and all produce
+   `redirect_uri_mismatch`.
+
+   When you deploy, come back and add the production callback as a second entry —
+   `https://your-backend.up.railway.app/api/auth/callback`. You can have several.
+
+5. **Create.** Google shows the Client ID and Client Secret once.
+6. Update **both** lines in `.env` this time:
+
+   ```
+   GOOGLE_CLIENT_ID=<new id>.apps.googleusercontent.com
+   GOOGLE_CLIENT_SECRET=<new secret>
+   ```
+
+Copy them straight from the browser into your editor. Do not route them through a screenshot,
+a chat message, or a scratch file.
+
+---
+
+### 4d. Verify
 
 ```bash
 cd "/home/arjun/Desktop/Student Personal Ai Assistant/student-ai-assistant/backend"
 ./venv/bin/python -c "
 from app.config import settings
-s = settings.google_client_secret
-print('client secret loaded:', s[:7] + '…' if s else 'MISSING')
-print('redirect URI       :', settings.google_redirect_uri)
+cid = settings.google_client_id
+print('client id     :', cid[:20] + '…' if cid else 'MISSING')
+print('project number:', cid.split('-')[0] if cid else '?')
+print('secret        :', 'set (' + str(len(settings.google_client_secret)) + ' chars)' if settings.google_client_secret else 'MISSING')
+print('redirect uri  :', settings.google_redirect_uri)
 "
 ```
 
-The real test is a working sign-in, which comes in Step 7.
+Check that the project number matches the project you just worked in, and that the redirect URI
+is character-for-character what you registered.
 
-- [ ] New secret in `.env`, old one deleted, redirect URI and test users checked
+The real test is a working sign-in, once you have a database (see the end of this document).
+
+- [ ] Right project identified, client is **Web application** type
+- [ ] The three APIs enabled, consent screen configured, my email in Test users
+- [ ] Redirect URI registered exactly
+- [ ] `.env` updated, old secret deleted
 
 ---
+
+### If sign-in fails later, it is almost always one of these
+
+| Error | Cause |
+|---|---|
+| `redirect_uri_mismatch` | Registered URI differs from `GOOGLE_REDIRECT_URI`, often by a slash |
+| `access_denied` | Your email is not in **Test users** while status is "Testing" |
+| `API has not been used in project…` | The Classroom / Calendar / Gmail API is not enabled |
+| `invalid_client` | Client ID and secret are from different clients or projects |
+| No refresh token stored | `prompt=consent` missing — already set in `app/api/auth.py` |
 
 ## Step 5 — `SECRET_KEY` (2 min)
 
@@ -379,22 +476,10 @@ That is the whole reason Step 1 says back it up before touching anything else.
 
 ---
 
-## Next: you still need a database
+## Next: the database
 
-Rotation does not unblock the app — the Supabase project is gone. Pick one:
+You already have one running locally (`scripts/dev_db.py`), so nothing here blocks you.
+For deployment you will want Supabase.
 
-```bash
-# Option A — local Postgres (needs Docker access; see README)
-sudo usermod -aG docker $USER && sudo apt install docker-compose-plugin
-# log out and back in, then:
-cd student-ai-assistant && docker compose up -d db redis
-cd backend && ./venv/bin/python scripts/migrate.py
-
-# Option B — new Supabase project
-# supabase.com → New project → Settings → Database → Connection string (URI)
-# put it in DATABASE_URL, then:
-cd backend && ./venv/bin/python scripts/migrate.py
-```
-
-Either way, `scripts/migrate.py` builds the whole schema. Then
-`python ../scripts/seed_demo_data.py` gives you something to look at.
+Full guide, including which Supabase connection mode to pick and why the free tier
+pauses: **[`docs/DATABASE.md`](DATABASE.md)**
