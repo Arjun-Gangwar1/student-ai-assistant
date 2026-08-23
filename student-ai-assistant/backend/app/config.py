@@ -47,6 +47,10 @@ class Settings(BaseSettings):
     # classification and answer failed. Overridable per environment so the next
     # decommission is an env change rather than a code change.
     groq_model: str = "openai/gpt-oss-20b"
+    # gpt-oss models emit hidden reasoning tokens before answering; that is most
+    # of their latency. "low" roughly halves it and costs little on grounded
+    # retrieval answers, where the facts are already in the prompt.
+    groq_reasoning_effort: str = "low"      # low | medium | high | default
     deepinfra_model: str = "meta-llama/Meta-Llama-3.1-8B-Instruct"
 
     # ── Telegram ─────────────────────────────────────────────────────────────

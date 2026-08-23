@@ -168,3 +168,36 @@ class TestKeywordFallback:
         """Used when embedding is unavailable — better than answering nothing."""
         results = await queries.search_items_keyword("Qualcomm", [corpus], limit=5)
         assert results and "Qualcomm" in results[0]["title"]
+
+
+class TestContextFormatting:
+    """
+    Regression guard: the LLM repeats whatever the context says, so a formatting
+    bug here becomes a wrong deadline shown to a student.
+    """
+
+    def test_deadline_is_rendered_in_ist_not_utc(self):
+        from datetime import datetime
+
+        from app.rag.retriever import format_context_for_llm
+        from app.utils.date_utils import UTC
+
+        # 18:29 UTC is 23:59 IST — the "end of day" default the extractor uses.
+        item = {
+            "id": "x",
+            "source": "gmail",
+            "title": "Assignment 3",
+            "summary": "Assignment 3",
+            "deadline": datetime(2026, 8, 24, 18, 29, tzinfo=UTC),
+            "created_at": datetime(2026, 8, 20, 10, 0, tzinfo=UTC),
+        }
+        context = format_context_for_llm([item])
+
+        assert "11:59 PM" in context, f"expected IST 11:59 PM, got:\n{context}"
+        assert "06:29 PM" not in context, "UTC time leaked into an IST-labelled field"
+
+    def test_no_deadline_line_when_absent(self):
+        from app.rag.retriever import format_context_for_llm
+
+        context = format_context_for_llm([{"id": "x", "source": "website", "title": "Notice"}])
+        assert "deadline:" not in context

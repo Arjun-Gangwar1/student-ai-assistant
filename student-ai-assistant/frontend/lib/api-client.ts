@@ -259,13 +259,138 @@ export const getEmail = (emailId: string) => apiFetch<EmailDetail>(`/api/emails/
 
 // ─── Chat ────────────────────────────────────────────────────────────────────
 
+export interface Conversation {
+  id: string;
+  title: string;
+  updated_at: string;
+  message_count: number;
+  preview: string | null;
+}
+
+export interface StoredMessage {
+  id: string;
+  role: "user" | "assistant";
+  content: string;
+  sources: Source[];
+  created_at: string;
+  error: string | null;
+}
+
 export const askQuestion = (
   question: string,
   history?: { role: "user" | "assistant"; content: string }[],
-) => post<ChatAnswer>("/api/chat/ask", { question, history });
+  conversationId?: string,
+) => post<ChatAnswer>("/api/chat/ask", { question, history, conversation_id: conversationId });
 
 export const getChatQuota = () =>
   apiFetch<{ remaining_today: number; daily_limit: number }>("/api/chat/quota");
+
+export const listConversations = () =>
+  apiFetch<{ conversations: Conversation[] }>("/api/chat/conversations");
+
+export const createConversation = () =>
+  post<{ id: string; title: string; updated_at: string }>("/api/chat/conversations");
+
+export const getConversation = (id: string) =>
+  apiFetch<{ id: string; title: string; messages: StoredMessage[] }>(
+    `/api/chat/conversations/${id}`,
+  );
+
+export const renameConversation = (id: string, title: string) =>
+  patch<{ id: string; title: string }>(`/api/chat/conversations/${id}`, { title });
+
+export const deleteConversation = (id: string) => del(`/api/chat/conversations/${id}`);
+
+/** Events emitted by the streaming endpoint, in order. */
+export type StreamEvent =
+  | { type: "start"; conversationId: string; messageId: string }
+  | { type: "sources"; sources: Source[] }
+  | { type: "delta"; text: string }
+  | { type: "done"; remainingToday: number }
+  | { type: "error"; detail: string };
+
+/**
+ * Stream an answer as Server-Sent Events.
+ *
+ * Uses fetch + a ReadableStream rather than EventSource, because EventSource
+ * cannot issue a POST and cannot be aborted mid-flight — and both matter here:
+ * the question goes in the body, and the stop button must actually stop it.
+ *
+ * Pass `signal` from an AbortController to cancel; the backend notices the
+ * disconnect and stops generating rather than finishing an unread answer.
+ */
+export async function* streamAnswer(
+  question: string,
+  opts: { conversationId?: string; signal?: AbortSignal } = {},
+): AsyncGenerator<StreamEvent> {
+  const res = await fetch(`${BASE}/api/chat/stream`, {
+    method: "POST",
+    credentials: "include",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ question, conversation_id: opts.conversationId }),
+    signal: opts.signal,
+  });
+
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}) as { detail?: string });
+    throw new ApiError(body.detail ?? `Request failed (${res.status})`, res.status);
+  }
+  if (!res.body) throw new ApiError("Streaming is not supported by this browser", 0);
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+
+    // SSE frames are separated by a blank line. A chunk can split a frame in
+    // half, so only complete frames are consumed and the remainder is kept.
+    const frames = buffer.split("\n\n");
+    buffer = frames.pop() ?? "";
+
+    for (const frame of frames) {
+      let event = "message";
+      let data = "";
+      for (const line of frame.split("\n")) {
+        if (line.startsWith("event: ")) event = line.slice(7).trim();
+        else if (line.startsWith("data: ")) data += line.slice(6);
+      }
+      if (!data) continue;
+
+      let payload: Record<string, unknown>;
+      try {
+        payload = JSON.parse(data);
+      } catch {
+        continue;
+      }
+
+      switch (event) {
+        case "start":
+          yield {
+            type: "start",
+            conversationId: String(payload.conversation_id),
+            messageId: String(payload.message_id),
+          };
+          break;
+        case "sources":
+          yield { type: "sources", sources: payload as unknown as Source[] };
+          break;
+        case "delta":
+          yield { type: "delta", text: String(payload.text ?? "") };
+          break;
+        case "done":
+          yield { type: "done", remainingToday: Number(payload.remaining_today ?? 0) };
+          break;
+        case "error":
+          yield { type: "error", detail: String(payload.detail ?? "Something went wrong") };
+          break;
+      }
+    }
+  }
+}
 
 // ─── Sync ────────────────────────────────────────────────────────────────────
 

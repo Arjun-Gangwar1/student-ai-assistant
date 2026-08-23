@@ -242,6 +242,7 @@ async def _handle_ask(chat_id: int, student: dict, question: str) -> None:
         student_ids=[student_id],
         year=student.get("year"),
         branch=student.get("branch"),
+        student=student,
     )
 
     answer = result["answer"]

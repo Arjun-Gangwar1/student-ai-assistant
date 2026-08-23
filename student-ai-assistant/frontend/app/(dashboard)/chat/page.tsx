@@ -1,91 +1,242 @@
 "use client";
 
-import { useState, useRef, useEffect } from "react";
-import { ApiError, askQuestion, type Source } from "@/lib/api-client";
-import { Send, Loader2 } from "lucide-react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  Check,
+  Copy,
+  FileText,
+  Loader2,
+  MessageSquarePlus,
+  Send,
+  Square,
+  Trash2,
+} from "lucide-react";
+import {
+  ApiError,
+  deleteConversation,
+  getConversation,
+  listConversations,
+  streamAnswer,
+  type Conversation,
+  type Source,
+} from "@/lib/api-client";
+import Markdown from "@/components/Markdown";
 
 const SUGGESTIONS = [
-  "What assignments are due this week?",
-  "Do I have any exams coming up?",
-  "What is today's mess menu?",
-  "Show me high priority items",
+  "What's due this week?",
+  "Any placement drives coming up?",
+  "Summarise my unread email",
+  "What did I miss yesterday?",
 ];
 
 interface Message {
+  id: string;
   role: "user" | "assistant";
   content: string;
   sources?: Source[];
+  streaming?: boolean;
+  error?: string | null;
 }
 
 export default function ChatPage() {
   const [messages, setMessages] = useState<Message[]>([]);
+  const [conversations, setConversations] = useState<Conversation[]>([]);
+  const [conversationId, setConversationId] = useState<string | null>(null);
   const [input, setInput] = useState("");
-  const [loading, setLoading] = useState(false);
-  const [quotaLeft, setQuotaLeft] = useState<number | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [showHistory, setShowHistory] = useState(false);
+  const [quota, setQuota] = useState<number | null>(null);
+
+  const abortRef = useRef<AbortController | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
+
+  const refreshConversations = useCallback(async () => {
+    try {
+      setConversations((await listConversations()).conversations);
+    } catch (err) {
+      if (err instanceof ApiError && err.isUnauthenticated) window.location.href = "/";
+    }
+  }, []);
 
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages]);
+    void refreshConversations();
+  }, [refreshConversations]);
 
-  const sendMessage = async (question: string) => {
-    if (!question.trim() || loading) return;
+  // Only autoscroll while streaming, so reading back through a long answer is
+  // not constantly yanked to the bottom.
+  useEffect(() => {
+    if (busy || messages.length) bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages, busy]);
 
-    const userMsg: Message = { role: "user", content: question };
-    setMessages((prev) => [...prev, userMsg]);
+  async function openConversation(id: string) {
+    setShowHistory(false);
+    try {
+      const convo = await getConversation(id);
+      setConversationId(id);
+      setMessages(
+        convo.messages.map((m) => ({
+          id: m.id,
+          role: m.role,
+          content: m.content,
+          sources: m.sources,
+          error: m.error,
+        })),
+      );
+    } catch {
+      // Deleted in another tab — drop it from the list rather than showing a dead row.
+      void refreshConversations();
+    }
+  }
+
+  function startNewChat() {
+    abortRef.current?.abort();
+    setConversationId(null);
+    setMessages([]);
+    setShowHistory(false);
+    inputRef.current?.focus();
+  }
+
+  async function send(question: string) {
+    const text = question.trim();
+    if (!text || busy) return;
+
     setInput("");
-    setLoading(true);
+    setBusy(true);
+
+    const userMessage: Message = { id: `u${Date.now()}`, role: "user", content: text };
+    const assistantId = `a${Date.now()}`;
+    setMessages((prev) => [
+      ...prev,
+      userMessage,
+      { id: assistantId, role: "assistant", content: "", streaming: true },
+    ]);
+
+    const controller = new AbortController();
+    abortRef.current = controller;
+    let activeConversation = conversationId;
 
     try {
-      // No student id: the session identifies the asker, so one student can
-      // never pose a question answered from another's retrieved context.
-      const history = messages.map((m) => ({ role: m.role, content: m.content }));
-      const res = await askQuestion(question, history);
-      setQuotaLeft(res.remaining_today);
-      setMessages((prev) => [
-        ...prev,
-        { role: "assistant", content: res.answer, sources: res.sources },
-      ]);
+      for await (const event of streamAnswer(text, {
+        conversationId: activeConversation ?? undefined,
+        signal: controller.signal,
+      })) {
+        switch (event.type) {
+          case "start":
+            activeConversation = event.conversationId;
+            setConversationId(event.conversationId);
+            break;
+          case "sources":
+            setMessages((prev) =>
+              prev.map((m) => (m.id === assistantId ? { ...m, sources: event.sources } : m)),
+            );
+            break;
+          case "delta":
+            setMessages((prev) =>
+              prev.map((m) =>
+                m.id === assistantId ? { ...m, content: m.content + event.text } : m,
+              ),
+            );
+            break;
+          case "error":
+            setMessages((prev) =>
+              prev.map((m) =>
+                m.id === assistantId ? { ...m, error: event.detail, streaming: false } : m,
+              ),
+            );
+            break;
+          case "done":
+            setQuota(event.remainingToday);
+            break;
+        }
+      }
     } catch (err) {
       if (err instanceof ApiError && err.isUnauthenticated) {
         window.location.href = "/";
         return;
       }
-      setMessages((prev) => [
-        ...prev,
-        {
-          role: "assistant",
-          content:
-            err instanceof ApiError && err.isRateLimited
-              ? err.message
-              : "Sorry, I couldn't process that. Please try again.",
-        },
-      ]);
+      // An abort is the stop button working, not a failure.
+      const aborted = err instanceof DOMException && err.name === "AbortError";
+      if (!aborted) {
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === assistantId
+              ? {
+                  ...m,
+                  error:
+                    err instanceof ApiError && err.isRateLimited
+                      ? err.message
+                      : "Something went wrong. Please try again.",
+                }
+              : m,
+          ),
+        );
+      }
     } finally {
-      setLoading(false);
+      setMessages((prev) =>
+        prev.map((m) => (m.id === assistantId ? { ...m, streaming: false } : m)),
+      );
+      setBusy(false);
+      abortRef.current = null;
+      void refreshConversations();
     }
-  };
+  }
+
+  function stop() {
+    abortRef.current?.abort();
+    setBusy(false);
+  }
 
   return (
     <div className="flex flex-col h-[calc(100vh-8rem)]">
-      <div className="flex items-baseline justify-between mb-3 flex-shrink-0">
+      {/* Header */}
+      <div className="flex items-center justify-between mb-3 flex-shrink-0">
         <h1 className="text-xl font-bold text-slate-100">Ask AI</h1>
-        {quotaLeft !== null && (
-          <span className="text-xs text-slate-500">{quotaLeft} questions left today</span>
-        )}
+        <div className="flex items-center gap-3">
+          {quota !== null && (
+            <span className="text-xs text-slate-500">{quota} left today</span>
+          )}
+          <button
+            onClick={() => setShowHistory((v) => !v)}
+            className="text-xs text-slate-400 hover:text-indigo-400 transition-colors"
+          >
+            History
+          </button>
+          <button
+            onClick={startNewChat}
+            title="New chat"
+            className="text-slate-400 hover:text-indigo-400 transition-colors"
+          >
+            <MessageSquarePlus className="w-4 h-4" />
+          </button>
+        </div>
       </div>
 
-      {/* Messages */}
-      <div className="flex-1 overflow-y-auto scrollbar-hide space-y-4 pr-1">
+      {showHistory && (
+        <HistoryPanel
+          conversations={conversations}
+          activeId={conversationId}
+          onOpen={openConversation}
+          onDelete={async (id) => {
+            await deleteConversation(id);
+            if (id === conversationId) startNewChat();
+            void refreshConversations();
+          }}
+          onClose={() => setShowHistory(false)}
+        />
+      )}
+
+      {/* Thread */}
+      <div className="flex-1 overflow-y-auto space-y-4 pr-1">
         {messages.length === 0 && (
           <div className="space-y-2 pt-4">
             <p className="text-slate-500 text-sm text-center mb-4">
-              Ask me anything about your deadlines, assignments, or notices.
+              Ask about your deadlines, assignments, email or campus notices.
             </p>
             {SUGGESTIONS.map((s) => (
               <button
                 key={s}
-                onClick={() => sendMessage(s)}
+                onClick={() => send(s)}
                 className="w-full text-left text-sm bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-xl px-4 py-3 text-slate-300 transition-colors"
               >
                 {s}
@@ -94,59 +245,177 @@ export default function ChatPage() {
           </div>
         )}
 
-        {messages.map((msg, i) => (
-          <div key={i} className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}>
-            <div
-              className={`max-w-[85%] rounded-2xl px-4 py-3 text-sm ${
-                msg.role === "user"
-                  ? "bg-indigo-600 text-white rounded-br-sm"
-                  : "bg-slate-800 text-slate-200 rounded-bl-sm border border-slate-700"
-              }`}
-            >
-              <p className="whitespace-pre-wrap">{msg.content}</p>
-              {msg.sources && msg.sources.length > 0 && (
-                <div className="mt-2 pt-2 border-t border-slate-700 space-y-1">
-                  <p className="text-xs text-slate-500">Sources:</p>
-                  {msg.sources.map((s) => (
-                    <p key={s.id} className="text-xs text-slate-500 truncate">
-                      📄 {s.title} · {s.source}
-                    </p>
-                  ))}
-                </div>
-              )}
-            </div>
-          </div>
+        {messages.map((message) => (
+          <MessageBubble key={message.id} message={message} />
         ))}
-
-        {loading && (
-          <div className="flex justify-start">
-            <div className="bg-slate-800 rounded-2xl rounded-bl-sm px-4 py-3 border border-slate-700">
-              <Loader2 className="w-4 h-4 animate-spin text-indigo-400" />
-            </div>
-          </div>
-        )}
         <div ref={bottomRef} />
       </div>
 
-      {/* Input */}
-      <div className="flex gap-2 mt-3 flex-shrink-0">
-        <input
-          type="text"
+      {/* Composer */}
+      <div className="flex gap-2 mt-3 flex-shrink-0 items-end">
+        <textarea
+          ref={inputRef}
+          rows={1}
           value={input}
-          onChange={(e) => setInput(e.target.value)}
-          onKeyDown={(e) => e.key === "Enter" && !e.shiftKey && sendMessage(input)}
-          placeholder="Ask about your deadlines, assignments..."
-          className="flex-1 bg-slate-800 border border-slate-700 rounded-xl px-4 py-3 text-sm text-slate-100 placeholder-slate-500 focus:outline-none focus:border-indigo-500"
-          disabled={loading}
+          onChange={(e) => {
+            setInput(e.target.value);
+            e.target.style.height = "auto";
+            e.target.style.height = `${Math.min(e.target.scrollHeight, 120)}px`;
+          }}
+          onKeyDown={(e) => {
+            // Enter sends; Shift+Enter makes a new line.
+            if (e.key === "Enter" && !e.shiftKey) {
+              e.preventDefault();
+              void send(input);
+            }
+          }}
+          placeholder="Ask about your deadlines…"
+          className="flex-1 resize-none bg-slate-800 border border-slate-700 rounded-xl px-4 py-3 text-sm text-slate-100 placeholder-slate-500 focus:outline-none focus:border-indigo-500 max-h-32"
         />
-        <button
-          onClick={() => sendMessage(input)}
-          disabled={loading || !input.trim()}
-          className="bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white p-3 rounded-xl transition-colors"
-        >
-          <Send className="w-4 h-4" />
-        </button>
+        {busy ? (
+          <button
+            onClick={stop}
+            title="Stop generating"
+            className="bg-slate-700 hover:bg-slate-600 text-slate-200 p-3 rounded-xl transition-colors"
+          >
+            <Square className="w-4 h-4 fill-current" />
+          </button>
+        ) : (
+          <button
+            onClick={() => send(input)}
+            disabled={!input.trim()}
+            className="bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white p-3 rounded-xl transition-colors"
+          >
+            <Send className="w-4 h-4" />
+          </button>
+        )}
       </div>
+    </div>
+  );
+}
+
+function MessageBubble({ message }: { message: Message }) {
+  const [copied, setCopied] = useState(false);
+  const isUser = message.role === "user";
+
+  return (
+    <div className={`flex ${isUser ? "justify-end" : "justify-start"}`}>
+      <div
+        className={`max-w-[88%] rounded-2xl px-4 py-3 ${
+          isUser
+            ? "bg-indigo-600 text-white rounded-br-sm text-sm"
+            : "bg-slate-800 text-slate-200 rounded-bl-sm border border-slate-700"
+        }`}
+      >
+        {isUser ? (
+          <p className="whitespace-pre-wrap">{message.content}</p>
+        ) : (
+          <>
+            {message.content ? (
+              <Markdown content={message.content} />
+            ) : message.streaming ? (
+              <div className="flex items-center gap-2 text-slate-500 text-sm">
+                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                Thinking…
+              </div>
+            ) : null}
+
+            {/* Caret while streaming, so it reads as live rather than stalled. */}
+            {message.streaming && message.content && (
+              <span className="inline-block w-1.5 h-4 bg-indigo-400 ml-0.5 animate-pulse align-text-bottom" />
+            )}
+
+            {message.error && (
+              <p className="text-red-300 text-sm mt-1">{message.error}</p>
+            )}
+
+            {!!message.sources?.length && !message.streaming && (
+              <div className="mt-3 pt-2 border-t border-slate-700/60">
+                <p className="text-[11px] text-slate-500 mb-1">Based on</p>
+                <div className="space-y-0.5">
+                  {message.sources.map((s) => (
+                    <p key={s.id} className="text-[11px] text-slate-500 truncate">
+                      <FileText className="w-3 h-3 inline mr-1 -mt-0.5" />
+                      {s.title} · {s.source}
+                    </p>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {message.content && !message.streaming && (
+              <button
+                onClick={() => {
+                  void navigator.clipboard.writeText(message.content);
+                  setCopied(true);
+                  setTimeout(() => setCopied(false), 1500);
+                }}
+                className="mt-2 text-[11px] text-slate-500 hover:text-slate-300 flex items-center gap-1 transition-colors"
+              >
+                {copied ? <Check className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
+                {copied ? "Copied" : "Copy"}
+              </button>
+            )}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function HistoryPanel({
+  conversations,
+  activeId,
+  onOpen,
+  onDelete,
+  onClose,
+}: {
+  conversations: Conversation[];
+  activeId: string | null;
+  onOpen: (id: string) => void;
+  onDelete: (id: string) => void;
+  onClose: () => void;
+}) {
+  return (
+    <div className="mb-3 bg-slate-900 border border-slate-700 rounded-xl p-2 max-h-64 overflow-y-auto flex-shrink-0">
+      {conversations.length === 0 ? (
+        <p className="text-slate-500 text-xs text-center py-4">
+          No previous chats yet.
+        </p>
+      ) : (
+        conversations.map((c) => (
+          <div
+            key={c.id}
+            className={`group flex items-center gap-2 rounded-lg px-2 py-2 hover:bg-slate-800 transition-colors ${
+              c.id === activeId ? "bg-slate-800" : ""
+            }`}
+          >
+            <button onClick={() => onOpen(c.id)} className="flex-1 text-left min-w-0">
+              <p className="text-sm text-slate-200 truncate">{c.title}</p>
+              <p className="text-[11px] text-slate-500">
+                {new Date(c.updated_at).toLocaleDateString("en-IN", {
+                  day: "numeric",
+                  month: "short",
+                })}{" "}
+                · {c.message_count} messages
+              </p>
+            </button>
+            <button
+              onClick={() => onDelete(c.id)}
+              className="opacity-0 group-hover:opacity-100 text-slate-600 hover:text-red-400 transition-all p-1"
+              title="Delete"
+            >
+              <Trash2 className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        ))
+      )}
+      <button
+        onClick={onClose}
+        className="w-full text-[11px] text-slate-500 hover:text-slate-300 py-1.5 mt-1"
+      >
+        Close
+      </button>
     </div>
   );
 }

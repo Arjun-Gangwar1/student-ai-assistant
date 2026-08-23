@@ -1082,3 +1082,194 @@ async def feedback_stats() -> dict:
     stats = dict(row)
     stats["accuracy"] = (stats["correct"] / stats["total"]) if stats["total"] else None
     return stats
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Conversations & messages (persistent chat)
+# ═══════════════════════════════════════════════════════════════════════════
+
+# A title is derived from the opening question rather than requested from the
+# user — nobody names a conversation before having it.
+TITLE_MAX_CHARS = 60
+
+
+def _derive_title(first_message: str) -> str:
+    text = " ".join((first_message or "").split())
+    if not text:
+        return "New chat"
+    if len(text) <= TITLE_MAX_CHARS:
+        return text
+    # Cut on a word boundary so titles do not end mid-word.
+    return text[:TITLE_MAX_CHARS].rsplit(" ", 1)[0] + "…"
+
+
+async def create_conversation(student_id: str, first_message: str | None = None) -> dict:
+    async with acquire() as conn:
+        return _row(
+            await conn.fetchrow(
+                "INSERT INTO conversations (student_id, title) VALUES ($1, $2) "
+                "RETURNING id, title, created_at, updated_at",
+                student_id,
+                _derive_title(first_message) if first_message else "New chat",
+            )
+        )
+
+
+async def list_conversations(student_id: str, limit: int = 50) -> list[dict]:
+    """Sidebar listing: newest activity first, with a preview of the last message."""
+    async with acquire() as conn:
+        return _rows(
+            await conn.fetch(
+                """
+                SELECT c.id, c.title, c.created_at, c.updated_at,
+                       (SELECT count(*) FROM messages m WHERE m.conversation_id = c.id) AS message_count,
+                       (SELECT left(m.content, 100) FROM messages m
+                         WHERE m.conversation_id = c.id
+                         ORDER BY m.created_at DESC LIMIT 1) AS preview
+                  FROM conversations c
+                 WHERE c.student_id = $1 AND c.archived = FALSE
+                 ORDER BY c.updated_at DESC
+                 LIMIT $2
+                """,
+                student_id,
+                limit,
+            )
+        )
+
+
+async def get_conversation(conversation_id: str, student_id: str) -> dict | None:
+    """Scoped by student_id — a foreign conversation id must return nothing."""
+    async with acquire() as conn:
+        return _row(
+            await conn.fetchrow(
+                "SELECT id, title, created_at, updated_at FROM conversations "
+                "WHERE id = $1 AND student_id = $2 AND archived = FALSE",
+                conversation_id,
+                student_id,
+            )
+        )
+
+
+async def get_messages(conversation_id: str, student_id: str, limit: int = 200) -> list[dict]:
+    async with acquire() as conn:
+        return _rows(
+            await conn.fetch(
+                """
+                SELECT m.id, m.role, m.content, m.sources, m.model,
+                       m.completed_at, m.error, m.created_at
+                  FROM messages m
+                  JOIN conversations c ON c.id = m.conversation_id
+                 WHERE m.conversation_id = $1 AND c.student_id = $2
+                 ORDER BY m.created_at
+                 LIMIT $3
+                """,
+                conversation_id,
+                student_id,
+                limit,
+            )
+        )
+
+
+async def add_message(
+    conversation_id: str,
+    role: str,
+    content: str,
+    sources: list | None = None,
+    model: str | None = None,
+    completed: bool = True,
+    error: str | None = None,
+) -> dict:
+    if role not in ("user", "assistant"):
+        raise ValueError(f"invalid role {role!r}")
+    async with acquire() as conn:
+        return _row(
+            await conn.fetchrow(
+                """
+                INSERT INTO messages (conversation_id, role, content, sources, model,
+                                      completed_at, error)
+                VALUES ($1, $2, $3, $4::jsonb, $5,
+                        CASE WHEN $6 THEN now() ELSE NULL END, $7)
+                RETURNING id, role, content, sources, model, completed_at, created_at
+                """,
+                conversation_id,
+                role,
+                content,
+                sources or [],
+                model,
+                completed,
+                error,
+            )
+        )
+
+
+async def finish_message(
+    message_id: str,
+    content: str,
+    sources: list | None = None,
+    error: str | None = None,
+) -> None:
+    """Complete a streamed assistant message once generation ends."""
+    async with acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE messages
+               SET content = $2,
+                   sources = COALESCE($3::jsonb, sources),
+                   error = $4,
+                   completed_at = now()
+             WHERE id = $1
+            """,
+            message_id,
+            content,
+            sources,
+            error,
+        )
+
+
+async def recent_turns(conversation_id: str, limit: int = 8) -> list[dict]:
+    """
+    The last few completed turns, oldest first, for prompt context.
+
+    Incomplete messages are excluded: a half-written answer from an aborted
+    stream would otherwise be replayed to the model as if it were said.
+    """
+    async with acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT role, content FROM (
+                SELECT role, content, created_at
+                  FROM messages
+                 WHERE conversation_id = $1
+                   AND (role = 'user' OR completed_at IS NOT NULL)
+                   AND content <> ''
+                 ORDER BY created_at DESC
+                 LIMIT $2
+            ) t ORDER BY created_at
+            """,
+            conversation_id,
+            limit,
+        )
+    return _rows(rows)
+
+
+async def rename_conversation(conversation_id: str, student_id: str, title: str) -> dict | None:
+    async with acquire() as conn:
+        return _row(
+            await conn.fetchrow(
+                "UPDATE conversations SET title = $3 WHERE id = $1 AND student_id = $2 "
+                "RETURNING id, title, updated_at",
+                conversation_id,
+                student_id,
+                title.strip()[:200] or "New chat",
+            )
+        )
+
+
+async def delete_conversation(conversation_id: str, student_id: str) -> bool:
+    async with acquire() as conn:
+        result = await conn.execute(
+            "DELETE FROM conversations WHERE id = $1 AND student_id = $2",
+            conversation_id,
+            student_id,
+        )
+    return result.endswith("1")

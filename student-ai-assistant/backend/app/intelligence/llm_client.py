@@ -17,6 +17,7 @@ import json
 import logging
 import re
 from abc import ABC, abstractmethod
+from collections.abc import AsyncIterator
 from typing import Any
 
 from tenacity import (
@@ -46,7 +47,26 @@ class BaseLLMClient(ABC):
         json_mode: bool = False,
         temperature: float = 0.1,
         max_tokens: int = 1024,
+        reasoning_effort: str | None = None,
     ) -> str:
+        ...
+
+    @abstractmethod
+    def stream(
+        self,
+        messages: list[dict],
+        temperature: float = 0.2,
+        max_tokens: int = 1024,
+        reasoning_effort: str | None = None,
+    ) -> AsyncIterator[str]:
+        """
+        Yield answer text as it is generated.
+
+        Streaming does not make generation faster — it makes the *wait* start
+        producing output at roughly 500ms instead of showing nothing for the full
+        second-plus. That gap is most of what separates a chat that feels instant
+        from one that feels broken.
+        """
         ...
 
 
@@ -73,13 +93,9 @@ class GroqClient(BaseLLMClient):
         json_mode: bool = False,
         temperature: float = 0.1,
         max_tokens: int = 1024,
+        reasoning_effort: str | None = None,
     ) -> str:
-        kwargs: dict[str, Any] = {
-            "model": self.model,
-            "messages": messages,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-        }
+        kwargs = self._kwargs(messages, temperature, max_tokens, reasoning_effort)
         if json_mode:
             kwargs["response_format"] = {"type": "json_object"}
         try:
@@ -87,6 +103,46 @@ class GroqClient(BaseLLMClient):
         except Exception as exc:
             raise LLMError(f"groq: {type(exc).__name__}: {exc}") from exc
         return resp.choices[0].message.content or ""
+
+    def _kwargs(self, messages, temperature, max_tokens, reasoning_effort) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        # gpt-oss models generate hidden reasoning tokens before answering, which
+        # is most of their latency. "low" roughly halves it, and for grounded
+        # retrieval answers — where the facts are already in the prompt — there
+        # is little for deep reasoning to add.
+        effort = reasoning_effort or settings.groq_reasoning_effort
+        if effort and effort != "default" and "gpt-oss" in self.model:
+            # Passed via extra_body rather than as a named argument: the pinned
+            # groq SDK (0.11.0) predates reasoning_effort and rejects it with a
+            # TypeError, while the API itself accepts it. extra_body forwards
+            # unknown fields verbatim, so this works across SDK versions.
+            kwargs["extra_body"] = {"reasoning_effort": effort}
+        return kwargs
+
+    async def stream(
+        self,
+        messages: list[dict],
+        temperature: float = 0.2,
+        max_tokens: int = 1024,
+        reasoning_effort: str | None = None,
+    ) -> AsyncIterator[str]:
+        kwargs = self._kwargs(messages, temperature, max_tokens, reasoning_effort)
+        kwargs["stream"] = True
+        try:
+            stream = await self._client.chat.completions.create(**kwargs)
+            async for chunk in stream:
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta
+                if text := getattr(delta, "content", None):
+                    yield text
+        except Exception as exc:
+            raise LLMError(f"groq stream: {type(exc).__name__}: {exc}") from exc
 
 
 class DeepInfraClient(BaseLLMClient):
@@ -118,6 +174,7 @@ class DeepInfraClient(BaseLLMClient):
         json_mode: bool = False,
         temperature: float = 0.1,
         max_tokens: int = 1024,
+        reasoning_effort: str | None = None,
     ) -> str:
         kwargs: dict[str, Any] = {
             "model": self.model,
@@ -132,6 +189,26 @@ class DeepInfraClient(BaseLLMClient):
         except Exception as exc:
             raise LLMError(f"deepinfra: {type(exc).__name__}: {exc}") from exc
         return resp.choices[0].message.content or ""
+
+    async def stream(
+        self,
+        messages: list[dict],
+        temperature: float = 0.2,
+        max_tokens: int = 1024,
+        reasoning_effort: str | None = None,
+    ) -> AsyncIterator[str]:
+        try:
+            stream = await self._client.chat.completions.create(
+                model=self.model, messages=messages, temperature=temperature,
+                max_tokens=max_tokens, stream=True,
+            )
+            async for chunk in stream:
+                if not chunk.choices:
+                    continue
+                if text := getattr(chunk.choices[0].delta, "content", None):
+                    yield text
+        except Exception as exc:
+            raise LLMError(f"deepinfra stream: {type(exc).__name__}: {exc}") from exc
 
 
 PROVIDERS: dict[str, type[BaseLLMClient]] = {

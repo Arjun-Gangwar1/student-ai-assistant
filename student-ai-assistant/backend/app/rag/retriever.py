@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from app.db import queries
 from app.intelligence.embedder import embed_text
 from app.intelligence.ranker import rank_items
+from app.utils.date_utils import to_ist
 
 logger = logging.getLogger(__name__)
 
@@ -85,7 +86,7 @@ def format_context_for_llm(items: list[dict], max_chars: int = 6000) -> str:
         body = (item.get("raw_content") or "").strip()
 
         created = item.get("created_at")
-        created_str = created.strftime("%d %b %Y") if isinstance(created, datetime) else ""
+        created_str = to_ist(created).strftime("%d %b %Y") if isinstance(created, datetime) else ""
 
         lines = [f"[{i}] source: {source}" + (f" | received: {created_str}" if created_str else "")]
         lines.append(f"title: {title}")
@@ -101,7 +102,13 @@ def format_context_for_llm(items: list[dict], max_chars: int = 6000) -> str:
                 else f"in {int(hours)}h" if hours < 48
                 else f"in {int(hours / 24)} days"
             )
-            lines.append(f"deadline: {deadline.strftime('%d %b %Y, %I:%M %p IST')} ({when})")
+            # Convert before formatting. Printing a UTC datetime under an "IST"
+            # label shifted every deadline 5h30m earlier, and the model then
+            # repeated the wrong time to the student verbatim — a wrong deadline
+            # is the one failure this product cannot afford.
+            lines.append(
+                f"deadline: {to_ist(deadline).strftime('%d %b %Y, %I:%M %p')} IST ({when})"
+            )
 
         # A little body text lets the model answer detail questions, but the
         # summary carries most of the signal, so keep the excerpt short.
