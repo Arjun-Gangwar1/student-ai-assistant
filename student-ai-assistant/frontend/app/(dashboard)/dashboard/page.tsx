@@ -8,9 +8,11 @@ import {
   getDeadlines,
   getItems,
   getMe,
+  getSyncStatus,
   syncNow,
   type Deadline,
   type Item,
+  type SyncStatus,
 } from "@/lib/api-client";
 import DeadlineRadar from "@/components/DeadlineRadar";
 import PriorityInbox from "@/components/PriorityInbox";
@@ -19,6 +21,7 @@ export default function Dashboard() {
   const [deadlines, setDeadlines] = useState<Deadline[]>([]);
   const [items, setItems] = useState<Item[]>([]);
   const [name, setName] = useState("");
+  const [status, setStatus] = useState<SyncStatus | null>(null);
   const [loading, setLoading] = useState(true);
   const [syncing, setSyncing] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -28,12 +31,16 @@ export default function Dashboard() {
       const me = await getMe();
       setName(me.name ?? "");
       // No student id in these calls — the session identifies the caller.
-      const [deadlineRes, itemRes] = await Promise.all([
+      const [deadlineRes, itemRes, syncStatus] = await Promise.all([
         getDeadlines(7),
         getItems({ priority: "HIGH", limit: 5, unread_only: true }),
+        // Lets the empty state distinguish "nothing due" from "never synced" —
+        // an empty radar otherwise reads as a broken or failed sign-in.
+        getSyncStatus().catch(() => null),
       ]);
       setDeadlines(deadlineRes.deadlines);
       setItems(itemRes.items);
+      setStatus(syncStatus);
       setError(null);
     } catch (err) {
       if (err instanceof ApiError && err.isUnauthenticated) {
@@ -105,6 +112,32 @@ export default function Dashboard() {
       {error && (
         <div className="bg-red-950/40 border border-red-900 rounded-xl px-4 py-3 text-sm text-red-300">
           {error}
+        </div>
+      )}
+
+      {/* First-run state. Signing in does not sync, so a new account lands on an
+          empty dashboard that looks identical to a failed login. Say which it is. */}
+      {!error && deadlines.length === 0 && items.length === 0 && status?.google_connected && (
+        <div className="bg-indigo-950/30 border border-indigo-800/50 rounded-xl px-4 py-4">
+          <p className="text-indigo-200 text-sm font-medium">
+            ✅ Signed in as {name || "you"} — nothing imported yet
+          </p>
+          <p className="text-indigo-200/70 text-xs mt-1 leading-relaxed">
+            Connected:{" "}
+            {Object.entries(status.connected_sources)
+              .filter(([, on]) => on)
+              .map(([source]) => source)
+              .join(", ") || "nothing yet"}
+            . Tap <span className="text-indigo-300">Sync</span> above to pull your
+            assignments, calendar and mail. The first sync takes a minute or two.
+          </p>
+          <button
+            onClick={handleSync}
+            disabled={syncing}
+            className="mt-3 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white text-sm font-medium px-4 py-2 rounded-lg transition-colors"
+          >
+            {syncing ? "Syncing…" : "Sync now"}
+          </button>
         </div>
       )}
 
