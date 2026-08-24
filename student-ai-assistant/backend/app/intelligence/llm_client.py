@@ -23,17 +23,23 @@ from typing import Any
 from tenacity import (
     retry,
     retry_if_exception_type,
+    retry_if_not_exception_type,
     stop_after_attempt,
     wait_exponential,
 )
 
 from app.config import settings
+from app.utils import token_budget
 
 logger = logging.getLogger(__name__)
 
 
 class LLMError(RuntimeError):
     """Any provider-side failure, normalised across SDKs."""
+
+
+class LLMQuotaExhausted(LLMError):
+    """A per-day quota was hit. Retrying within the same minute cannot help."""
 
 
 class BaseLLMClient(ABC):
@@ -70,6 +76,30 @@ class BaseLLMClient(ABC):
         ...
 
 
+def _wrap(exc: Exception) -> LLMError:
+    """
+    Normalise a provider exception, distinguishing a per-day quota hit (not
+    worth retrying for minutes) from anything transient (worth retrying).
+    """
+    message = str(exc)
+    if "per day" in message.lower():
+        return LLMQuotaExhausted(f"groq: {type(exc).__name__}: {exc}")
+    return LLMError(f"groq: {type(exc).__name__}: {exc}")
+
+
+def _estimate_tokens(messages: list[dict], max_tokens: int) -> int:
+    """
+    Rough token estimate for budget accounting — not billing-accurate.
+
+    ~4 characters/token is the standard rule of thumb for English text. This
+    deliberately overestimates a little (few completions use the full
+    max_tokens ceiling) because the budget exists to avoid *causing* a 429,
+    so erring conservative is the safe direction.
+    """
+    input_chars = sum(len(m.get("content", "")) for m in messages)
+    return (input_chars // 4) + max_tokens
+
+
 class GroqClient(BaseLLMClient):
     name = "groq"
 
@@ -84,7 +114,7 @@ class GroqClient(BaseLLMClient):
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=1, max=10),
-        retry=retry_if_exception_type(LLMError),
+        retry=retry_if_exception_type(LLMError) & retry_if_not_exception_type(LLMQuotaExhausted),
         reraise=True,
     )
     async def chat(
@@ -101,7 +131,8 @@ class GroqClient(BaseLLMClient):
         try:
             resp = await self._client.chat.completions.create(**kwargs)
         except Exception as exc:
-            raise LLMError(f"groq: {type(exc).__name__}: {exc}") from exc
+            raise _wrap(exc) from exc
+        token_budget.record(_estimate_tokens(messages, max_tokens))
         return resp.choices[0].message.content or ""
 
     def _kwargs(self, messages, temperature, max_tokens, reasoning_effort) -> dict[str, Any]:
@@ -142,7 +173,8 @@ class GroqClient(BaseLLMClient):
                 if text := getattr(delta, "content", None):
                     yield text
         except Exception as exc:
-            raise LLMError(f"groq stream: {type(exc).__name__}: {exc}") from exc
+            raise _wrap(exc) from exc
+        token_budget.record(_estimate_tokens(messages, max_tokens))
 
 
 class DeepInfraClient(BaseLLMClient):

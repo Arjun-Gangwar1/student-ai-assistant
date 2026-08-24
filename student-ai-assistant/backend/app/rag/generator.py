@@ -19,9 +19,15 @@ from datetime import datetime
 
 from app.intelligence.llm_client import llm
 from app.rag.retriever import format_context_for_llm, retrieve
+from app.utils import token_budget
 from app.utils.date_utils import now_ist
 
 logger = logging.getLogger(__name__)
+
+QUOTA_MESSAGE = (
+    "I've hit today's AI usage cap on the free plan. It resets after midnight — "
+    "your deadlines and email are still synced, just ask again then."
+)
 
 RAG_SYSTEM = """You are the Student AI Assistant for IIT Dharwad students.
 You help students stay on top of deadlines, assignments, notices and campus events.
@@ -141,6 +147,10 @@ async def answer_question(
 ) -> dict:
     """Non-streaming answer. Used by Telegram, where there is nothing to stream to."""
     items = await retrieve(question, student_ids, top_k=6)
+
+    if not token_budget.allow_chat():
+        return {"answer": QUOTA_MESSAGE, "sources": _sources(items)}
+
     messages = _build_messages(question, items, student, year, branch, chat_history)
 
     try:
@@ -178,6 +188,10 @@ async def stream_answer(
         items = []
 
     yield "sources", _sources(items)
+
+    if not token_budget.allow_chat():
+        yield "error", QUOTA_MESSAGE
+        return
 
     messages = _build_messages(question, items, student, year, branch, chat_history)
 

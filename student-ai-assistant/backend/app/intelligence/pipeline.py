@@ -24,6 +24,7 @@ from app.db import queries
 from app.intelligence.classifier import classify_item
 from app.intelligence.embedder import embed_batch
 from app.intelligence.extractor import extract_deadlines
+from app.utils import token_budget
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +79,8 @@ async def process_student_items(student: dict, limit: int = 50) -> int:
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_LLM)
 
     async def classify_one(item: dict) -> dict:
+        if not token_budget.allow_background():
+            raise RuntimeError("daily token budget reserved for chat — deferred to next run")
         async with semaphore:
             return await classify_item(
                 raw_content=item.get("raw_content", ""),
@@ -99,6 +102,8 @@ async def process_student_items(student: dict, limit: int = 50) -> int:
             return []          # source already gave us an authoritative date
         if not DATE_HINT_RE.search(text):
             return []
+        if not token_budget.allow_background():
+            return []          # classify_one already deferred this item; skip extraction too
         async with semaphore:
             return await extract_deadlines(text, source=item.get("source", "unknown"))
 
