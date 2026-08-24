@@ -55,10 +55,45 @@ DATE_HINT_RE = re.compile(
 )
 
 
-def _deadline_dedup_key(item: dict, title: str) -> str:
-    """Stable identity for a deadline derived from an item's text."""
-    slug = re.sub(r"[^a-z0-9]+", "-", title.lower())[:40].strip("-")
-    return f"extracted:{item['id']}:{slug}"
+
+# Words that describe "this is a deadline" rather than identifying *which*
+# deadline. Three emails about the same hackathon called it "application
+# deadline", "registration deadline", and just "deadline" — different words,
+# same event. Stripping these before slugging collapses all three to one key.
+_DEADLINE_FILLER_WORDS = {
+    "deadline", "date", "due", "last", "final", "extended",
+    "application", "applications", "registration", "registrations",
+    "apply", "submit", "submission", "submissions",
+    "closes", "closing", "close", "for", "the", "to", "by", "is",
+}
+
+
+def _deadline_dedup_key(deadline: dict) -> str:
+    """
+    Stable identity for an LLM-extracted deadline, keyed on the deadline's own
+    normalised title rather than the item it came from or its exact due time.
+
+    Keying on item_id meant the same real-world event mentioned in three
+    separate marketing emails — three different items — produced three
+    separate deadline rows. Keying on content instead lets `upsert_deadline`'s
+    ON CONFLICT merge them into one, which is what the upsert was already
+    built to do (it only exists to avoid duplicate rows across re-syncs — the
+    item_id keying just aimed that at the wrong axis).
+
+    Due date is deliberately left out of the key: different emails about the
+    same event routinely give slightly different or vaguer due times, and the
+    goal is one row that gets refined as later syncs bring a more precise
+    date, not one row per phrasing of the deadline. This is safe specifically
+    because LLM extraction only runs for prose sources (email, website,
+    telegram) — see EXTRACTION_SOURCES; Classroom/Calendar deadlines carry a
+    native id and never go through this function, so a genuinely recurring
+    assignment (e.g. "Assignment 2" then "Assignment 3") never collapses,
+    since its distinguishing number survives filtering.
+    """
+    words = re.findall(r"[a-z0-9]+", deadline["title"].lower())
+    core = [w for w in words if w not in _DEADLINE_FILLER_WORDS]
+    slug = "-".join(core or words)[:50]
+    return f"extracted:{slug}"
 
 
 async def process_student_items(student: dict, limit: int = 50) -> int:
@@ -159,7 +194,7 @@ async def process_student_items(student: dict, limit: int = 50) -> int:
             for deadline in extracted:
                 await queries.upsert_deadline(
                     student_id=student_id,
-                    dedup_key=_deadline_dedup_key(item, deadline["title"]),
+                    dedup_key=_deadline_dedup_key(deadline),
                     item_id=item_id,
                     title=deadline["title"],
                     due_at=deadline["due_at"],
