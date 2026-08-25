@@ -10,15 +10,17 @@ import json
 import logging
 from typing import AsyncIterator, Literal, Optional
 
-from fastapi import APIRouter, HTTPException, Request, status
+from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from app.api.deps import CurrentStudent, CurrentStudentId
 from app.config import settings
+from app.connectors.gmail_conn import TEXT_EXTENSIONS, extract_text_from_bytes
 from app.db import queries
 from app.intelligence.llm_client import llm
-from app.rag.generator import answer_question, stream_answer
+from app.intelligence.uploads import MAX_UPLOAD_BYTES, UPLOAD_TEXT_CHARS, index_upload
+from app.rag.generator import answer_about_document, answer_question, stream_answer
 from app.utils.ratelimit import RateLimiter
 
 logger = logging.getLogger(__name__)
@@ -230,6 +232,90 @@ async def ask(body: AskRequest, student: CurrentStudent):
             conversation_id, "assistant", result["answer"],
             sources=result["sources"], model=llm().model,
         )
+
+    return ChatResponse(
+        answer=result["answer"],
+        sources=[Source(**s) for s in result["sources"]],
+        conversation_id=conversation_id,
+        remaining_today=remaining,
+    )
+
+
+# ─── Document upload ─────────────────────────────────────────────────────────
+
+@router.post("/upload", response_model=ChatResponse)
+async def upload_document(
+    student: CurrentStudent,
+    file: UploadFile = File(...),
+    question: str = Form(""),
+    conversation_id: Optional[str] = Form(None),
+):
+    """
+    Upload a document, get an answer now, and keep it searchable afterward.
+
+    Both halves happen in this one request: the extracted text goes straight
+    into the prompt for an immediate answer (see answer_about_document — it
+    does not wait on retrieval ranking a same-request upload highly), and
+    separately becomes a normal `items` row with an embedding, so a later
+    question in another conversation can still find it via hybrid search.
+    """
+    filename = file.filename or "upload"
+    if not filename.lower().endswith(TEXT_EXTENSIONS):
+        raise HTTPException(
+            status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            f"Unsupported file type. Supported: {', '.join(TEXT_EXTENSIONS)}",
+        )
+
+    data = await file.read()
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            f"File too large — max {MAX_UPLOAD_BYTES // (1024 * 1024)}MB.",
+        )
+
+    text = extract_text_from_bytes(
+        data, file.content_type or "", filename, max_chars=UPLOAD_TEXT_CHARS
+    )
+    if not text.strip():
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Couldn't read any text from this file. It may be a scanned image "
+            "or an unsupported format.",
+        )
+
+    student_id = str(student["id"])
+    remaining = _check_quota(student_id)
+
+    question = question.strip() or f"Summarise {filename} and flag any deadline it mentions."
+    user_note = f"📎 {filename}\n{question}"
+
+    conversation_id = await _resolve_conversation(conversation_id, student_id, user_note)
+    await queries.add_message(conversation_id, "user", user_note)
+
+    history = await queries.recent_turns(conversation_id, limit=9)
+    history = [h for h in history if h["content"] != user_note][-8:]
+
+    item = await index_upload(
+        student_id=student_id, filename=filename, text=text,
+        year=student.get("year"), branch=student.get("branch"),
+    )
+    document_source = {
+        "id": str(item["id"]), "title": filename, "source": "upload",
+        "created_at": item["created_at"].isoformat() if item.get("created_at") else None,
+        "deadline": None,
+    }
+
+    result = await answer_about_document(
+        question=question, filename=filename, document_text=text,
+        document_source=document_source, student_ids=[student_id],
+        chat_history=history, year=student.get("year"), branch=student.get("branch"),
+        student=student,
+    )
+
+    await queries.add_message(
+        conversation_id, "assistant", result["answer"],
+        sources=result["sources"], model=llm().model,
+    )
 
     return ChatResponse(
         answer=result["answer"],

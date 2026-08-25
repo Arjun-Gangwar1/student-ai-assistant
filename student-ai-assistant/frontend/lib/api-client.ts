@@ -301,6 +301,51 @@ export const renameConversation = (id: string, title: string) =>
 
 export const deleteConversation = (id: string) => del(`/api/chat/conversations/${id}`);
 
+/** Supported by the extraction backend — see TEXT_EXTENSIONS in gmail_conn.py. */
+export const UPLOAD_ACCEPT = ".pdf,.docx,.doc,.txt,.md,.csv";
+
+export interface UploadAnswer {
+  answer: string;
+  sources: Source[];
+  conversation_id: string;
+  remaining_today: number;
+}
+
+/**
+ * Upload a document, get an answer grounded in it immediately, and have it
+ * indexed for later search — one request does both.
+ *
+ * Not routed through apiFetch: that helper always sends
+ * "Content-Type: application/json", which would stop the browser from
+ * setting the multipart boundary a file upload needs.
+ */
+export async function uploadDocument(
+  file: File,
+  opts: { question?: string; conversationId?: string } = {},
+): Promise<UploadAnswer> {
+  const form = new FormData();
+  form.append("file", file);
+  if (opts.question) form.append("question", opts.question);
+  if (opts.conversationId) form.append("conversation_id", opts.conversationId);
+
+  let res: Response;
+  try {
+    res = await fetch(`${BASE}/api/chat/upload`, {
+      method: "POST",
+      credentials: "include",
+      body: form,
+    });
+  } catch {
+    throw new ApiError("Can't reach the server. Check your connection.", 0);
+  }
+
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}) as { detail?: string });
+    throw new ApiError(body.detail ?? `Upload failed (${res.status})`, res.status);
+  }
+  return res.json() as Promise<UploadAnswer>;
+}
+
 /** Events emitted by the streaming endpoint, in order. */
 export type StreamEvent =
   | { type: "start"; conversationId: string; messageId: string }

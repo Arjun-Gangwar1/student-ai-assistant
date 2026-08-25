@@ -7,6 +7,7 @@ import {
   FileText,
   Loader2,
   MessageSquarePlus,
+  Paperclip,
   Send,
   Square,
   Trash2,
@@ -17,6 +18,8 @@ import {
   getConversation,
   listConversations,
   streamAnswer,
+  uploadDocument,
+  UPLOAD_ACCEPT,
   type Conversation,
   type Source,
 } from "@/lib/api-client";
@@ -44,12 +47,14 @@ export default function ChatPage() {
   const [conversationId, setConversationId] = useState<string | null>(null);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
+  const [uploading, setUploading] = useState(false);
   const [showHistory, setShowHistory] = useState(false);
   const [quota, setQuota] = useState<number | null>(null);
 
   const abortRef = useRef<AbortController | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   const refreshConversations = useCallback(async () => {
     try {
@@ -99,7 +104,7 @@ export default function ChatPage() {
 
   async function send(question: string) {
     const text = question.trim();
-    if (!text || busy) return;
+    if (!text || busy || uploading) return;
 
     setInput("");
     setBusy(true);
@@ -187,6 +192,64 @@ export default function ChatPage() {
     setBusy(false);
   }
 
+  async function handleFileSelected(file: File) {
+    if (busy || uploading) return;
+    setUploading(true);
+
+    const question = input.trim();
+    setInput("");
+
+    const userMessage: Message = {
+      id: `u${Date.now()}`,
+      role: "user",
+      content: `📎 ${file.name}` + (question ? `\n${question}` : ""),
+    };
+    const assistantId = `a${Date.now()}`;
+    setMessages((prev) => [
+      ...prev,
+      userMessage,
+      { id: assistantId, role: "assistant", content: "", streaming: true },
+    ]);
+
+    try {
+      const result = await uploadDocument(file, {
+        question: question || undefined,
+        conversationId: conversationId ?? undefined,
+      });
+      setConversationId(result.conversation_id);
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === assistantId
+            ? { ...m, content: result.answer, sources: result.sources, streaming: false }
+            : m,
+        ),
+      );
+      setQuota(result.remaining_today);
+    } catch (err) {
+      if (err instanceof ApiError && err.isUnauthenticated) {
+        window.location.href = "/";
+        return;
+      }
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === assistantId
+            ? {
+                ...m,
+                streaming: false,
+                error:
+                  err instanceof ApiError
+                    ? err.message
+                    : "Couldn't process that file. Please try again.",
+              }
+            : m,
+        ),
+      );
+    } finally {
+      setUploading(false);
+      void refreshConversations();
+    }
+  }
+
   return (
     <div className="flex flex-col h-[calc(100vh-8rem)]">
       {/* Header */}
@@ -253,10 +316,30 @@ export default function ChatPage() {
 
       {/* Composer */}
       <div className="flex gap-2 mt-3 flex-shrink-0 items-end">
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept={UPLOAD_ACCEPT}
+          className="hidden"
+          onChange={(e) => {
+            const file = e.target.files?.[0];
+            e.target.value = "";       // allow re-selecting the same file later
+            if (file) void handleFileSelected(file);
+          }}
+        />
+        <button
+          onClick={() => fileInputRef.current?.click()}
+          disabled={busy || uploading}
+          title="Attach a document"
+          className="bg-slate-800 hover:bg-slate-700 disabled:opacity-40 text-slate-400 hover:text-indigo-400 border border-slate-700 p-3 rounded-xl transition-colors"
+        >
+          <Paperclip className="w-4 h-4" />
+        </button>
         <textarea
           ref={inputRef}
           rows={1}
           value={input}
+          disabled={uploading}
           onChange={(e) => {
             setInput(e.target.value);
             e.target.style.height = "auto";
@@ -269,8 +352,8 @@ export default function ChatPage() {
               void send(input);
             }
           }}
-          placeholder="Ask about your deadlines…"
-          className="flex-1 resize-none bg-slate-800 border border-slate-700 rounded-xl px-4 py-3 text-sm text-slate-100 placeholder-slate-500 focus:outline-none focus:border-indigo-500 max-h-32"
+          placeholder={uploading ? "Reading your document…" : "Ask about your deadlines…"}
+          className="flex-1 resize-none bg-slate-800 border border-slate-700 rounded-xl px-4 py-3 text-sm text-slate-100 placeholder-slate-500 focus:outline-none focus:border-indigo-500 max-h-32 disabled:opacity-60"
         />
         {busy ? (
           <button
@@ -279,6 +362,14 @@ export default function ChatPage() {
             className="bg-slate-700 hover:bg-slate-600 text-slate-200 p-3 rounded-xl transition-colors"
           >
             <Square className="w-4 h-4 fill-current" />
+          </button>
+        ) : uploading ? (
+          <button
+            disabled
+            title="Reading document…"
+            className="bg-indigo-600 opacity-40 text-white p-3 rounded-xl"
+          >
+            <Loader2 className="w-4 h-4 animate-spin" />
           </button>
         ) : (
           <button

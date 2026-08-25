@@ -177,8 +177,10 @@ def _collect_attachments(payload: dict, out: list[dict]) -> None:
         _collect_attachments(part, out)
 
 
-def extract_text_from_bytes(data: bytes, mime_type: str, filename: str) -> str:
-    """Pull text out of an attachment. Returns '' when unsupported."""
+def extract_text_from_bytes(
+    data: bytes, mime_type: str, filename: str, max_chars: int = MAX_EXTRACTED_CHARS
+) -> str:
+    """Pull text out of a file. Returns '' when unsupported."""
     lower = filename.lower()
     try:
         if mime_type == "application/pdf" or lower.endswith(".pdf"):
@@ -186,7 +188,7 @@ def extract_text_from_bytes(data: bytes, mime_type: str, filename: str) -> str:
 
             with pdfplumber.open(io.BytesIO(data)) as pdf:
                 pages = [page.extract_text() or "" for page in pdf.pages[:20]]
-            return _normalise("\n".join(pages))[:MAX_EXTRACTED_CHARS]
+            return _normalise("\n".join(pages))[:max_chars]
 
         if lower.endswith((".docx", ".doc")) or mime_type in (
             "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -203,15 +205,15 @@ def extract_text_from_bytes(data: bytes, mime_type: str, filename: str) -> str:
                     cells = [c.text.strip() for c in row.cells if c.text.strip()]
                     if cells:
                         paragraphs.append(" | ".join(cells))
-            return _normalise("\n".join(paragraphs))[:MAX_EXTRACTED_CHARS]
+            return _normalise("\n".join(paragraphs))[:max_chars]
 
         if mime_type in ("text/plain", "text/markdown", "text/csv") or lower.endswith(
             (".txt", ".md", ".csv")
         ):
-            return _normalise(data.decode("utf-8", errors="ignore"))[:MAX_EXTRACTED_CHARS]
+            return _normalise(data.decode("utf-8", errors="ignore"))[:max_chars]
 
     except Exception as exc:
-        logger.warning("Attachment text extraction failed (%s): %s", filename, exc)
+        logger.warning("Text extraction failed (%s): %s", filename, exc)
 
     return ""
 
