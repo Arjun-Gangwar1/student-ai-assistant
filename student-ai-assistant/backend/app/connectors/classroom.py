@@ -11,12 +11,13 @@ fields, not from an LLM reading prose, so they are stored confirmed.
 """
 
 import logging
+from datetime import timedelta
 
 from starlette.concurrency import run_in_threadpool
 
 from app.connectors.google_auth import GoogleAuthError, build_service, has_scope
 from app.db import queries
-from app.utils.date_utils import parse_classroom_date
+from app.utils.date_utils import now_utc, parse_classroom_date, parse_iso
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +26,12 @@ MAX_ANNOUNCEMENTS_PER_COURSE = 20
 # in the past. Fetching them wastes quota and pollutes the radar.
 COURSE_STATES = ["ACTIVE"]
 
+# ACTIVE alone is not enough: IITDh does not appear to archive courses when a
+# semester ends, so "MA 101 2024" is still returned as ACTIVE two years later.
+# A course with no coursework or announcement activity in this window is
+# treated as a finished semester Google was never told to close out.
+COURSE_STALE_AFTER = timedelta(days=270)
+
 
 async def sync_student_classroom(student: dict) -> dict:
     """
@@ -32,7 +39,10 @@ async def sync_student_classroom(student: dict) -> dict:
     Returns counts; never raises for a single course's failure.
     """
     student_id = str(student["id"])
-    counts = {"courses": 0, "assignments": 0, "announcements": 0, "errors": 0}
+    counts = {
+        "courses": 0, "assignments": 0, "announcements": 0,
+        "errors": 0, "stale_courses_skipped": 0,
+    }
 
     if not has_scope(student, "classroom"):
         logger.info("Classroom scope not granted for %s — skipping", student_id)
@@ -63,18 +73,57 @@ async def sync_student_classroom(student: dict) -> dict:
         course_id = course["id"]
         course_name = course.get("name", "Unknown course")
 
-        counts["assignments"] += await _sync_coursework(
-            service, student_id, course_id, course_name, counts
+        coursework = await _fetch_coursework(service, course_id, course_name, counts)
+        announcements = await _fetch_announcements(service, course_id, course_name, counts)
+
+        if not _course_is_current(coursework, announcements):
+            logger.info(
+                "Skipping stale course %r (%s) — no activity in %d days",
+                course_name, course_id, COURSE_STALE_AFTER.days,
+            )
+            counts["stale_courses_skipped"] += 1
+            continue
+
+        counts["assignments"] += await _save_coursework(
+            student_id, course_id, course_name, coursework, counts
         )
-        counts["announcements"] += await _sync_announcements(
-            service, student_id, course_id, course_name, counts
+        counts["announcements"] += await _save_announcements(
+            student_id, course_id, course_name, announcements, counts
         )
 
     logger.info("Classroom sync for %s: %s", student_id, counts)
     return counts
 
 
-async def _sync_coursework(service, student_id, course_id, course_name, counts) -> int:
+def _course_is_current(coursework: list[dict], announcements: list[dict]) -> bool:
+    """
+    True if this course has any coursework or announcement activity within
+    COURSE_STALE_AFTER, or has none at all yet (a brand-new course with
+    nothing posted should not be treated as finished).
+    """
+    if not coursework and not announcements:
+        return True
+
+    cutoff = now_utc() - COURSE_STALE_AFTER
+
+    for work in coursework:
+        if due_date := work.get("dueDate"):
+            try:
+                if parse_classroom_date(due_date, work.get("dueTime")) >= cutoff:
+                    return True
+            except ValueError:
+                pass
+        if (created := parse_iso(work.get("creationTime"))) and created >= cutoff:
+            return True
+
+    for announcement in announcements:
+        if (updated := parse_iso(announcement.get("updateTime"))) and updated >= cutoff:
+            return True
+
+    return False
+
+
+async def _fetch_coursework(service, course_id, course_name, counts) -> list[dict]:
     try:
         response = await run_in_threadpool(
             lambda: service.courses()
@@ -85,10 +134,13 @@ async def _sync_coursework(service, student_id, course_id, course_name, counts) 
     except Exception as exc:
         logger.warning("Coursework fetch failed (%s): %s", course_name, exc)
         counts["errors"] += 1
-        return 0
+        return []
+    return response.get("courseWork", [])
 
+
+async def _save_coursework(student_id, course_id, course_name, coursework, counts) -> int:
     saved = 0
-    for work in response.get("courseWork", []):
+    for work in coursework:
         title = work.get("title", "Untitled")
         description = work.get("description", "")
 
@@ -137,7 +189,7 @@ async def _sync_coursework(service, student_id, course_id, course_name, counts) 
     return saved
 
 
-async def _sync_announcements(service, student_id, course_id, course_name, counts) -> int:
+async def _fetch_announcements(service, course_id, course_name, counts) -> list[dict]:
     try:
         response = await run_in_threadpool(
             lambda: service.courses()
@@ -149,10 +201,13 @@ async def _sync_announcements(service, student_id, course_id, course_name, count
     except Exception as exc:
         logger.warning("Announcements fetch failed (%s): %s", course_name, exc)
         counts["errors"] += 1
-        return 0
+        return []
+    return response.get("announcements", [])
 
+
+async def _save_announcements(student_id, course_id, course_name, announcements, counts) -> int:
     saved = 0
-    for announcement in response.get("announcements", []):
+    for announcement in announcements:
         text = (announcement.get("text") or "").strip()
         if not text:
             continue
