@@ -14,6 +14,7 @@ coalesces a backlog instead of stampeding.
 
 import asyncio
 import logging
+from datetime import datetime, timedelta
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -139,6 +140,20 @@ async def job_purge_deleted() -> None:
         logger.error("purge_deleted failed: %s", exc)
 
 
+def _soon(seconds: int) -> datetime:
+    """
+    First run time for an interval job.
+
+    IntervalTrigger counts its first fire a full interval after startup, so a
+    restart silently parks every sync for up to its whole period — two hours
+    for Classroom. A deploy landing mid-pipeline therefore left items ingested
+    but unprocessed, with nothing due to retry them for the rest of that window.
+    Staggered here rather than all at zero so a cold boot does not fire every
+    connector at once while the embedding model is still loading.
+    """
+    return datetime.now(IST) + timedelta(seconds=seconds)
+
+
 def create_scheduler() -> AsyncIOScheduler:
     scheduler = AsyncIOScheduler(
         timezone=IST,
@@ -154,16 +169,19 @@ def create_scheduler() -> AsyncIOScheduler:
     scheduler.add_job(
         job_sync_gmail,
         IntervalTrigger(minutes=settings.gmail_poll_interval_minutes),
+        next_run_time=_soon(90),
         id="gmail_sync", name="Gmail sync", replace_existing=True,
     )
     scheduler.add_job(
         job_sync_classroom,
         IntervalTrigger(minutes=settings.classroom_poll_interval_minutes),
+        next_run_time=_soon(150),
         id="classroom_sync", name="Classroom sync", replace_existing=True,
     )
     scheduler.add_job(
         job_sync_calendar,
         IntervalTrigger(minutes=settings.calendar_poll_interval_minutes),
+        next_run_time=_soon(210),
         id="calendar_sync", name="Calendar sync", replace_existing=True,
     )
     scheduler.add_job(

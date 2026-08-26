@@ -96,11 +96,34 @@ def _deadline_dedup_key(deadline: dict) -> str:
     return f"extracted:{slug}"
 
 
+MAX_DRAIN_BATCHES = 12
+
+
 async def process_student_items(student: dict, limit: int = 50) -> int:
     """
-    Process every unprocessed item for one student.
-    Returns the number successfully processed.
+    Process every unprocessed item for one student, draining the backlog in
+    batches of `limit`. Returns the number successfully processed.
+
+    Draining matters after a first sync or a restart: one pass used to stop at
+    `limit` and wait for the next scheduled run, so a 300-item first sync took
+    days to classify on a two-hour Classroom interval.
+
+    A short batch ends the loop. Items that fail stay unprocessed, so the next
+    fetch would return the very same rows -- looping on them would spin on a
+    failing set and burn quota rather than make progress. Those are left for the
+    next scheduled run instead. MAX_DRAIN_BATCHES caps the work either way.
     """
+    total = 0
+    for _ in range(MAX_DRAIN_BATCHES):
+        done = await _process_batch(student, limit)
+        total += done
+        if done < limit:
+            break
+    return total
+
+
+async def _process_batch(student: dict, limit: int) -> int:
+    """One pass: classify, extract, embed and persist up to `limit` items."""
     student_id = str(student["id"])
     year, branch = student.get("year"), student.get("branch")
 
