@@ -14,12 +14,13 @@ Verified live against the real API (2026-08-26), not assumed:
   - The /audio/speech endpoint caps `input` at 200 characters per call
     (stated explicitly in Groq's docs, under Orpheus' Limitations) — a
     normal chat answer needs several calls, stitched into one clip.
-  - canopylabs/orpheus-v1-english returns `model_terms_required` until the
-    org admin accepts the model's terms in the Groq console — a one-time
-    account-level step this code cannot do on its own. Until that happens
-    every /speak call fails upstream; the error message says so in the
-    server log even though the API response to the student stays a plain
-    502, matching how every other upstream failure here is surfaced.
+  - `response_format` is required, not optional. Omitting it fails the whole
+    request with "response_format must be one of [wav]" — which reads like a
+    value error and is easy to misread as a gating or entitlement problem.
+  - canopylabs/orpheus-v1-english can return `model_terms_required` on an org
+    that has not accepted the model's terms in the Groq console — a one-time
+    account-level step this code cannot do on its own. This account has
+    accepted them; the branch stays for anyone deploying against a fresh org.
 """
 
 import io
@@ -121,7 +122,13 @@ def _stitch_wav(clips: list[bytes]) -> bytes:
 
     out = io.BytesIO()
     with wave.open(out, "wb") as writer:
-        writer.setparams(params)
+        # nframes must be reset, not inherited. Orpheus streams its audio, so
+        # it cannot know the length when it writes the header and ships a
+        # placeholder instead (nframes 0x7FFFFFFF, RIFF size 0xFFFFFFFF).
+        # readframes() copes with that, but feeding the placeholder back into
+        # setparams() makes the writer declare 4 GB of audio and overflow the
+        # uint32 size field on close. Zero lets it count the real frames.
+        writer.setparams(params._replace(nframes=0))
         for chunk in frames:
             writer.writeframes(chunk)
     return out.getvalue()
@@ -131,7 +138,14 @@ async def _speak_chunk(client: httpx.AsyncClient, text: str) -> bytes:
     resp = await client.post(
         "https://api.groq.com/openai/v1/audio/speech",
         headers={"Authorization": f"Bearer {settings.groq_api_key}"},
-        json={"model": settings.groq_tts_model, "input": text, "voice": settings.groq_tts_voice},
+        json={
+            "model": settings.groq_tts_model,
+            "input": text,
+            "voice": settings.groq_tts_voice,
+            # Required, not optional: the endpoint rejects the request outright
+            # with "response_format must be one of [wav]" when it is omitted.
+            "response_format": "wav",
+        },
     )
     if resp.status_code == 200:
         return resp.content

@@ -25,6 +25,21 @@ def _session_cookie(student_id: str) -> str:
     return itsdangerous.TimestampSigner(settings.secret_key).sign(payload).decode()
 
 
+def _streaming_wav_bytes(nframes: int = 100) -> bytes:
+    """
+    A WAV shaped the way Orpheus actually returns one.
+
+    Because the audio is streamed, the length is unknown when the header is
+    written, so the size fields carry placeholders (RIFF size 0xFFFFFFFF,
+    nframes 0x7FFFFFFF) instead of real values. _wav_bytes() is too well-formed
+    to catch code that trusts those fields.
+    """
+    raw = bytearray(_wav_bytes(nframes))
+    raw[4:8] = (0xFFFFFFFF).to_bytes(4, "little")      # RIFF chunk size
+    raw[40:44] = (0x7FFFFFFF * 2).to_bytes(4, "little")  # data chunk size
+    return bytes(raw)
+
+
 def _wav_bytes(nframes: int = 100) -> bytes:
     buf = io.BytesIO()
     with wave.open(buf, "wb") as w:
@@ -65,6 +80,20 @@ class TestWavStitching:
         stitched = _stitch_wav([_wav_bytes(50), _wav_bytes(30), _wav_bytes(20)])
         with wave.open(io.BytesIO(stitched), "rb") as r:
             assert r.getnframes() == 100
+
+    def test_streaming_placeholder_header_does_not_overflow_output(self):
+        """
+        Orpheus ships placeholder size fields. Propagating them into the output
+        header made it declare ~4 GB of audio and blew up packing the uint32
+        size on close, so every multi-chunk answer failed at the stitch.
+        """
+        stitched = _stitch_wav(
+            [_streaming_wav_bytes(50), _streaming_wav_bytes(30), _streaming_wav_bytes(20)]
+        )
+        with wave.open(io.BytesIO(stitched), "rb") as r:
+            assert r.getnframes() == 100
+        # The real byte count, not a placeholder, must reach the header.
+        assert int.from_bytes(stitched[4:8], "little") == len(stitched) - 8
 
 
 @pytest.fixture
