@@ -46,6 +46,9 @@ class AskRequest(BaseModel):
     # Trimmed server-side regardless of what a client sends: history is echoed
     # into the prompt, so its length is both a cost and an injection surface.
     history: Optional[list[ChatMessage]] = Field(default=None, max_length=20)
+    # Replace the previous answer to this same question rather than asking it
+    # again — requires an existing conversation_id.
+    regenerate: bool = False
 
 
 class Source(BaseModel):
@@ -125,9 +128,20 @@ async def ask_streaming(body: AskRequest, request: Request, student: CurrentStud
 
     student_id = str(student["id"])
     remaining = _check_quota(student_id)
-    conversation_id = await _resolve_conversation(body.conversation_id, student_id, question)
 
-    await queries.add_message(conversation_id, "user", question)
+    if body.regenerate:
+        if not body.conversation_id:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST, "regenerate requires an existing conversation"
+            )
+        conversation_id = await _resolve_conversation(body.conversation_id, student_id, question)
+        # The old reply is removed rather than left in place: it did not answer
+        # well enough to keep, and a second row for the same question would
+        # otherwise sit alongside the new one in history.
+        await queries.delete_last_assistant_message(conversation_id, student_id)
+    else:
+        conversation_id = await _resolve_conversation(body.conversation_id, student_id, question)
+        await queries.add_message(conversation_id, "user", question)
 
     # Prefer stored history over whatever the client sent: it is authoritative,
     # survives a page reload, and cannot be used to smuggle fabricated turns into

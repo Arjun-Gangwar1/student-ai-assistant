@@ -9,6 +9,7 @@ import {
   MessageSquarePlus,
   Mic,
   Paperclip,
+  RefreshCw,
   Send,
   Square,
   Trash2,
@@ -125,20 +126,33 @@ export default function ChatPage() {
     inputRef.current?.focus();
   }
 
-  async function send(question: string) {
+  async function send(question: string, opts: { regenerateAssistantId?: string } = {}) {
     const text = question.trim();
     if (!text || busy || uploading || recording || transcribing) return;
 
-    setInput("");
+    const regenerating = !!opts.regenerateAssistantId;
+    if (!regenerating) setInput("");
     setBusy(true);
 
-    const userMessage: Message = { id: `u${Date.now()}`, role: "user", content: text };
-    const assistantId = `a${Date.now()}`;
-    setMessages((prev) => [
-      ...prev,
-      userMessage,
-      { id: assistantId, role: "assistant", content: "", streaming: true },
-    ]);
+    let assistantId: string;
+    if (regenerating) {
+      assistantId = opts.regenerateAssistantId!;
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === assistantId
+            ? { ...m, content: "", sources: undefined, error: null, streaming: true }
+            : m,
+        ),
+      );
+    } else {
+      const userMessage: Message = { id: `u${Date.now()}`, role: "user", content: text };
+      assistantId = `a${Date.now()}`;
+      setMessages((prev) => [
+        ...prev,
+        userMessage,
+        { id: assistantId, role: "assistant", content: "", streaming: true },
+      ]);
+    }
 
     const controller = new AbortController();
     abortRef.current = controller;
@@ -148,6 +162,7 @@ export default function ChatPage() {
       for await (const event of streamAnswer(text, {
         conversationId: activeConversation ?? undefined,
         signal: controller.signal,
+        regenerate: regenerating,
       })) {
         switch (event.type) {
           case "start":
@@ -213,6 +228,14 @@ export default function ChatPage() {
   function stop() {
     abortRef.current?.abort();
     setBusy(false);
+  }
+
+  function regenerate(assistantId: string) {
+    if (!conversationId) return;
+    const idx = messages.findIndex((m) => m.id === assistantId);
+    const lastQuestion = [...messages.slice(0, idx)].reverse().find((m) => m.role === "user");
+    if (!lastQuestion) return;
+    void send(lastQuestion.content, { regenerateAssistantId: assistantId });
   }
 
   async function handleFileSelected(file: File) {
@@ -411,13 +434,19 @@ export default function ChatPage() {
           </div>
         )}
 
-        {messages.map((message) => (
+        {messages.map((message, i) => (
           <MessageBubble
             key={message.id}
             message={message}
             onSpeak={() => void toggleSpeak(message)}
             speaking={speakingId === message.id}
             speakLoading={speakLoadingId === message.id}
+            // Regenerating replaces the *stored* last assistant reply, so
+            // offering it anywhere but the true last message would delete a
+            // different answer than the one the student clicked on.
+            canRegenerate={message.role === "assistant" && i === messages.length - 1}
+            onRegenerate={() => regenerate(message.id)}
+            regenerateDisabled={busy || uploading || recording || transcribing}
           />
         ))}
         <div ref={bottomRef} />
@@ -524,11 +553,17 @@ function MessageBubble({
   onSpeak,
   speaking,
   speakLoading,
+  canRegenerate,
+  onRegenerate,
+  regenerateDisabled,
 }: {
   message: Message;
   onSpeak: () => void;
   speaking: boolean;
   speakLoading: boolean;
+  canRegenerate: boolean;
+  onRegenerate: () => void;
+  regenerateDisabled: boolean;
 }) {
   const [copied, setCopied] = useState(false);
   const isUser = message.role === "user";
@@ -578,32 +613,47 @@ function MessageBubble({
               </div>
             )}
 
-            {message.content && !message.streaming && (
+            {!message.streaming && (message.content || (canRegenerate && message.error)) && (
               <div className="mt-2 flex items-center gap-3">
-                <button
-                  onClick={() => {
-                    void navigator.clipboard.writeText(message.content);
-                    setCopied(true);
-                    setTimeout(() => setCopied(false), 1500);
-                  }}
-                  className="text-[11px] text-slate-500 hover:text-slate-300 flex items-center gap-1 transition-colors"
-                >
-                  {copied ? <Check className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
-                  {copied ? "Copied" : "Copy"}
-                </button>
-                <button
-                  onClick={onSpeak}
-                  className={`text-[11px] flex items-center gap-1 transition-colors ${
-                    speaking ? "text-indigo-400" : "text-slate-500 hover:text-slate-300"
-                  }`}
-                >
-                  {speakLoading ? (
-                    <Loader2 className="w-3 h-3 animate-spin" />
-                  ) : (
-                    <Volume2 className="w-3 h-3" />
-                  )}
-                  {speakLoading ? "Loading…" : speaking ? "Stop" : "Listen"}
-                </button>
+                {message.content && (
+                  <button
+                    onClick={() => {
+                      void navigator.clipboard.writeText(message.content);
+                      setCopied(true);
+                      setTimeout(() => setCopied(false), 1500);
+                    }}
+                    className="text-[11px] text-slate-500 hover:text-slate-300 flex items-center gap-1 transition-colors"
+                  >
+                    {copied ? <Check className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
+                    {copied ? "Copied" : "Copy"}
+                  </button>
+                )}
+                {message.content && (
+                  <button
+                    onClick={onSpeak}
+                    className={`text-[11px] flex items-center gap-1 transition-colors ${
+                      speaking ? "text-indigo-400" : "text-slate-500 hover:text-slate-300"
+                    }`}
+                  >
+                    {speakLoading ? (
+                      <Loader2 className="w-3 h-3 animate-spin" />
+                    ) : (
+                      <Volume2 className="w-3 h-3" />
+                    )}
+                    {speakLoading ? "Loading…" : speaking ? "Stop" : "Listen"}
+                  </button>
+                )}
+                {canRegenerate && (
+                  <button
+                    onClick={onRegenerate}
+                    disabled={regenerateDisabled}
+                    title={message.error ? "Retry" : "Regenerate response"}
+                    className="text-[11px] text-slate-500 hover:text-slate-300 disabled:opacity-40 flex items-center gap-1 transition-colors"
+                  >
+                    <RefreshCw className="w-3 h-3" />
+                    {message.error ? "Retry" : "Regenerate"}
+                  </button>
+                )}
               </div>
             )}
           </>

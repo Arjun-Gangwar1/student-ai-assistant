@@ -1273,3 +1273,31 @@ async def delete_conversation(conversation_id: str, student_id: str) -> bool:
             student_id,
         )
     return result.endswith("1")
+
+
+async def delete_last_assistant_message(conversation_id: str, student_id: str) -> bool:
+    """
+    Remove the most recent assistant reply.
+
+    Used by regenerate: rather than appending a second answer to the same
+    question (which would leave both the wrong one and the new one in
+    history), the old reply is deleted first so the new streamed answer
+    takes its place.
+    """
+    async with acquire() as conn:
+        result = await conn.execute(
+            """
+            DELETE FROM messages
+             WHERE id = (
+                 SELECT m.id
+                   FROM messages m
+                   JOIN conversations c ON c.id = m.conversation_id
+                  WHERE m.conversation_id = $1 AND c.student_id = $2 AND m.role = 'assistant'
+                  ORDER BY m.created_at DESC
+                  LIMIT 1
+             )
+            """,
+            conversation_id,
+            student_id,
+        )
+    return result.endswith("1")

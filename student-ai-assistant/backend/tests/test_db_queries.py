@@ -204,6 +204,45 @@ class TestStudentIsolation:
         assert await queries.mark_item_read(str(mine["id"]), str(student["id"])) is True
 
 
+class TestRegenerate:
+    """delete_last_assistant_message backs the chat 'regenerate' action."""
+
+    async def test_deletes_only_the_most_recent_assistant_reply(self, student):
+        student_id = str(student["id"])
+        convo = await queries.create_conversation(student_id, first_message="Q1")
+        convo_id = str(convo["id"])
+
+        await queries.add_message(convo_id, "user", "Q1")
+        first_answer = await queries.add_message(convo_id, "assistant", "A1")
+        await queries.add_message(convo_id, "user", "Q2")
+        second_answer = await queries.add_message(convo_id, "assistant", "A2")
+
+        assert await queries.delete_last_assistant_message(convo_id, student_id) is True
+
+        remaining = [m["id"] for m in await queries.get_messages(convo_id, student_id)]
+        assert first_answer["id"] in remaining
+        assert second_answer["id"] not in remaining
+
+    async def test_is_scoped_to_owner(self, student):
+        other = await queries.upsert_student(
+            google_id="other3", email="other3@iitdh.ac.in", name="Other", scopes=[],
+        )
+        convo = await queries.create_conversation(str(student["id"]), first_message="Q")
+        convo_id = str(convo["id"])
+        await queries.add_message(convo_id, "user", "Q")
+        answer = await queries.add_message(convo_id, "assistant", "A")
+
+        assert await queries.delete_last_assistant_message(convo_id, str(other["id"])) is False
+
+        remaining = [m["id"] for m in await queries.get_messages(convo_id, str(student["id"]))]
+        assert answer["id"] in remaining
+
+    async def test_empty_conversation_is_a_no_op(self, student):
+        student_id = str(student["id"])
+        convo = await queries.create_conversation(student_id)
+        assert await queries.delete_last_assistant_message(str(convo["id"]), student_id) is False
+
+
 class TestDigestGuard:
     async def test_second_digest_same_day_is_rejected(self, student):
         """Enforced by a unique index, not by scheduler discipline."""

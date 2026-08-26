@@ -366,13 +366,17 @@ export type StreamEvent =
  */
 export async function* streamAnswer(
   question: string,
-  opts: { conversationId?: string; signal?: AbortSignal } = {},
+  opts: { conversationId?: string; signal?: AbortSignal; regenerate?: boolean } = {},
 ): AsyncGenerator<StreamEvent> {
   const res = await fetch(`${BASE}/api/chat/stream`, {
     method: "POST",
     credentials: "include",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ question, conversation_id: opts.conversationId }),
+    body: JSON.stringify({
+      question,
+      conversation_id: opts.conversationId,
+      regenerate: opts.regenerate ?? false,
+    }),
     signal: opts.signal,
   });
 
