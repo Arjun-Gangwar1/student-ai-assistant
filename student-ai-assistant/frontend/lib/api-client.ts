@@ -437,6 +437,58 @@ export async function* streamAnswer(
   }
 }
 
+// ─── Voice ───────────────────────────────────────────────────────────────────
+
+/**
+ * Speech to text — upload a recorded clip, get back the transcript to fill
+ * the chat composer with (not auto-sent, so the student can fix a mishear
+ * before it becomes a question).
+ */
+export async function transcribeAudio(blob: Blob): Promise<string> {
+  const form = new FormData();
+  const ext = blob.type.includes("webm") ? "webm" : blob.type.includes("mp4") ? "m4a" : "wav";
+  form.append("file", blob, `recording.${ext}`);
+
+  let res: Response;
+  try {
+    res = await fetch(`${BASE}/api/voice/transcribe`, {
+      method: "POST",
+      credentials: "include",
+      body: form,
+    });
+  } catch {
+    throw new ApiError("Can't reach the server. Check your connection.", 0);
+  }
+
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}) as { detail?: string });
+    throw new ApiError(body.detail ?? `Transcription failed (${res.status})`, res.status);
+  }
+  const { text } = (await res.json()) as { text: string };
+  return text;
+}
+
+/** Text to speech — returns a playable audio blob (WAV) for one answer. */
+export async function speakText(text: string): Promise<Blob> {
+  let res: Response;
+  try {
+    res = await fetch(`${BASE}/api/voice/speak`, {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text }),
+    });
+  } catch {
+    throw new ApiError("Can't reach the server. Check your connection.", 0);
+  }
+
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}) as { detail?: string });
+    throw new ApiError(body.detail ?? `Speech synthesis failed (${res.status})`, res.status);
+  }
+  return res.blob();
+}
+
 // ─── Sync ────────────────────────────────────────────────────────────────────
 
 export const syncNow = () =>

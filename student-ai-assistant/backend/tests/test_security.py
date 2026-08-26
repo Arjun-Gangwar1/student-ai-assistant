@@ -126,6 +126,7 @@ class TestEndpointAuthentication:
             ("DELETE", "/api/auth/account"),
             ("PATCH", "/api/items/abc/read"),
             ("PATCH", "/api/deadlines/abc/confirm"),
+            ("POST", "/api/voice/speak"),
         ],
     )
     def test_requires_authentication(self, client, method, path):

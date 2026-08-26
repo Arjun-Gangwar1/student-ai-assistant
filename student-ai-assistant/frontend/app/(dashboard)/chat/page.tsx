@@ -7,17 +7,21 @@ import {
   FileText,
   Loader2,
   MessageSquarePlus,
+  Mic,
   Paperclip,
   Send,
   Square,
   Trash2,
+  Volume2,
 } from "lucide-react";
 import {
   ApiError,
   deleteConversation,
   getConversation,
   listConversations,
+  speakText,
   streamAnswer,
+  transcribeAudio,
   uploadDocument,
   UPLOAD_ACCEPT,
   type Conversation,
@@ -50,11 +54,21 @@ export default function ChatPage() {
   const [uploading, setUploading] = useState(false);
   const [showHistory, setShowHistory] = useState(false);
   const [quota, setQuota] = useState<number | null>(null);
+  const [recording, setRecording] = useState(false);
+  const [transcribing, setTranscribing] = useState(false);
+  const [micError, setMicError] = useState<string | null>(null);
+  // Which message's audio is loading or currently playing — only one clip
+  // plays at a time, so a click on a second bubble stops the first.
+  const [speakingId, setSpeakingId] = useState<string | null>(null);
+  const [speakLoadingId, setSpeakLoadingId] = useState<string | null>(null);
 
   const abortRef = useRef<AbortController | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const audioChunksRef = useRef<Blob[]>([]);
+  const audioElRef = useRef<HTMLAudioElement | null>(null);
 
   const refreshConversations = useCallback(async () => {
     try {
@@ -73,6 +87,15 @@ export default function ChatPage() {
   useEffect(() => {
     if (busy || messages.length) bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, busy]);
+
+  // Navigating away mid-recording or mid-playback should not leave the mic
+  // hot or audio playing in the background.
+  useEffect(() => {
+    return () => {
+      mediaRecorderRef.current?.stop();
+      audioElRef.current?.pause();
+    };
+  }, []);
 
   async function openConversation(id: string) {
     setShowHistory(false);
@@ -104,7 +127,7 @@ export default function ChatPage() {
 
   async function send(question: string) {
     const text = question.trim();
-    if (!text || busy || uploading) return;
+    if (!text || busy || uploading || recording || transcribing) return;
 
     setInput("");
     setBusy(true);
@@ -250,6 +273,86 @@ export default function ChatPage() {
     }
   }
 
+  async function startRecording() {
+    if (busy || uploading || recording) return;
+    setMicError(null);
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const recorder = new MediaRecorder(stream);
+      audioChunksRef.current = [];
+      recorder.ondataavailable = (e) => {
+        if (e.data.size > 0) audioChunksRef.current.push(e.data);
+      };
+      recorder.onstop = () => {
+        stream.getTracks().forEach((t) => t.stop());
+        const blob = new Blob(audioChunksRef.current, {
+          type: recorder.mimeType || "audio/webm",
+        });
+        void transcribeRecording(blob);
+      };
+      recorder.start();
+      mediaRecorderRef.current = recorder;
+      setRecording(true);
+    } catch {
+      setMicError("Couldn't access the microphone. Check your browser permissions.");
+    }
+  }
+
+  function stopRecording() {
+    mediaRecorderRef.current?.stop();
+    mediaRecorderRef.current = null;
+    setRecording(false);
+  }
+
+  async function transcribeRecording(blob: Blob) {
+    setTranscribing(true);
+    try {
+      const text = await transcribeAudio(blob);
+      // Appended, not replaced — a student may have already typed part of
+      // the question and just wants to add to it by voice.
+      setInput((prev) => (prev ? `${prev} ${text}` : text));
+      inputRef.current?.focus();
+    } catch (err) {
+      if (err instanceof ApiError && err.isUnauthenticated) {
+        window.location.href = "/";
+        return;
+      }
+      setMicError(err instanceof ApiError ? err.message : "Couldn't transcribe that recording.");
+    } finally {
+      setTranscribing(false);
+    }
+  }
+
+  async function toggleSpeak(message: Message) {
+    // Clicking the bubble that is already playing (or loading) stops it.
+    if (speakingId === message.id || speakLoadingId === message.id) {
+      audioElRef.current?.pause();
+      setSpeakingId(null);
+      setSpeakLoadingId(null);
+      return;
+    }
+    audioElRef.current?.pause();
+    setSpeakingId(null);
+    setSpeakLoadingId(message.id);
+    try {
+      const blob = await speakText(message.content);
+      const url = URL.createObjectURL(blob);
+      const audio = new Audio(url);
+      audioElRef.current = audio;
+      audio.onended = () => {
+        setSpeakingId(null);
+        URL.revokeObjectURL(url);
+      };
+      setSpeakLoadingId(null);
+      setSpeakingId(message.id);
+      await audio.play();
+    } catch (err) {
+      setSpeakLoadingId(null);
+      setSpeakingId(null);
+      if (err instanceof ApiError && err.isUnauthenticated) window.location.href = "/";
+    }
+  }
+
   return (
     <div className="flex flex-col h-[calc(100vh-8rem)]">
       {/* Header */}
@@ -309,7 +412,13 @@ export default function ChatPage() {
         )}
 
         {messages.map((message) => (
-          <MessageBubble key={message.id} message={message} />
+          <MessageBubble
+            key={message.id}
+            message={message}
+            onSpeak={() => void toggleSpeak(message)}
+            speaking={speakingId === message.id}
+            speakLoading={speakLoadingId === message.id}
+          />
         ))}
         <div ref={bottomRef} />
       </div>
@@ -329,11 +438,27 @@ export default function ChatPage() {
         />
         <button
           onClick={() => fileInputRef.current?.click()}
-          disabled={busy || uploading}
+          disabled={busy || uploading || recording}
           title="Attach a document"
           className="bg-slate-800 hover:bg-slate-700 disabled:opacity-40 text-slate-400 hover:text-indigo-400 border border-slate-700 p-3 rounded-xl transition-colors"
         >
           <Paperclip className="w-4 h-4" />
+        </button>
+        <button
+          onClick={recording ? stopRecording : startRecording}
+          disabled={busy || uploading || transcribing}
+          title={recording ? "Stop recording" : "Ask by voice"}
+          className={`p-3 rounded-xl transition-colors border ${
+            recording
+              ? "bg-red-500/20 border-red-500/50 text-red-400 animate-pulse"
+              : "bg-slate-800 hover:bg-slate-700 disabled:opacity-40 text-slate-400 hover:text-indigo-400 border-slate-700"
+          }`}
+        >
+          {transcribing ? (
+            <Loader2 className="w-4 h-4 animate-spin" />
+          ) : (
+            <Mic className="w-4 h-4" />
+          )}
         </button>
         <textarea
           ref={inputRef}
@@ -352,7 +477,15 @@ export default function ChatPage() {
               void send(input);
             }
           }}
-          placeholder={uploading ? "Reading your document…" : "Ask about your deadlines…"}
+          placeholder={
+            recording
+              ? "Listening…"
+              : transcribing
+                ? "Transcribing…"
+                : uploading
+                  ? "Reading your document…"
+                  : "Ask about your deadlines…"
+          }
           className="flex-1 resize-none bg-slate-800 border border-slate-700 rounded-xl px-4 py-3 text-sm text-slate-100 placeholder-slate-500 focus:outline-none focus:border-indigo-500 max-h-32 disabled:opacity-60"
         />
         {busy ? (
@@ -363,10 +496,10 @@ export default function ChatPage() {
           >
             <Square className="w-4 h-4 fill-current" />
           </button>
-        ) : uploading ? (
+        ) : uploading || transcribing ? (
           <button
             disabled
-            title="Reading document…"
+            title={uploading ? "Reading document…" : "Transcribing…"}
             className="bg-indigo-600 opacity-40 text-white p-3 rounded-xl"
           >
             <Loader2 className="w-4 h-4 animate-spin" />
@@ -374,18 +507,29 @@ export default function ChatPage() {
         ) : (
           <button
             onClick={() => send(input)}
-            disabled={!input.trim()}
+            disabled={!input.trim() || recording}
             className="bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white p-3 rounded-xl transition-colors"
           >
             <Send className="w-4 h-4" />
           </button>
         )}
       </div>
+      {micError && <p className="text-red-400 text-xs mt-1.5">{micError}</p>}
     </div>
   );
 }
 
-function MessageBubble({ message }: { message: Message }) {
+function MessageBubble({
+  message,
+  onSpeak,
+  speaking,
+  speakLoading,
+}: {
+  message: Message;
+  onSpeak: () => void;
+  speaking: boolean;
+  speakLoading: boolean;
+}) {
   const [copied, setCopied] = useState(false);
   const isUser = message.role === "user";
 
@@ -435,17 +579,32 @@ function MessageBubble({ message }: { message: Message }) {
             )}
 
             {message.content && !message.streaming && (
-              <button
-                onClick={() => {
-                  void navigator.clipboard.writeText(message.content);
-                  setCopied(true);
-                  setTimeout(() => setCopied(false), 1500);
-                }}
-                className="mt-2 text-[11px] text-slate-500 hover:text-slate-300 flex items-center gap-1 transition-colors"
-              >
-                {copied ? <Check className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
-                {copied ? "Copied" : "Copy"}
-              </button>
+              <div className="mt-2 flex items-center gap-3">
+                <button
+                  onClick={() => {
+                    void navigator.clipboard.writeText(message.content);
+                    setCopied(true);
+                    setTimeout(() => setCopied(false), 1500);
+                  }}
+                  className="text-[11px] text-slate-500 hover:text-slate-300 flex items-center gap-1 transition-colors"
+                >
+                  {copied ? <Check className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
+                  {copied ? "Copied" : "Copy"}
+                </button>
+                <button
+                  onClick={onSpeak}
+                  className={`text-[11px] flex items-center gap-1 transition-colors ${
+                    speaking ? "text-indigo-400" : "text-slate-500 hover:text-slate-300"
+                  }`}
+                >
+                  {speakLoading ? (
+                    <Loader2 className="w-3 h-3 animate-spin" />
+                  ) : (
+                    <Volume2 className="w-3 h-3" />
+                  )}
+                  {speakLoading ? "Loading…" : speaking ? "Stop" : "Listen"}
+                </button>
+              </div>
             )}
           </>
         )}

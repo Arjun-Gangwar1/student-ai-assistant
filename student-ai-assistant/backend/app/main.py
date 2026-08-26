@@ -17,7 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.middleware.sessions import SessionMiddleware
 
-from app.api import auth, chat, deadlines, emails, items, sync, telegram_webhook
+from app.api import auth, chat, deadlines, emails, items, sync, telegram_webhook, voice
 from app.config import settings
 from app.db.pool import close_pool, init_pool
 from app.intelligence.embedder import warm_up
@@ -132,7 +132,7 @@ async def unhandled_exception(request: Request, exc: Exception):
 
 
 # ── Routers ──────────────────────────────────────────────────────────────────
-for router in (auth, chat, deadlines, items, emails, sync, telegram_webhook):
+for router in (auth, chat, deadlines, items, emails, sync, telegram_webhook, voice):
     app.include_router(router.router)
 
 

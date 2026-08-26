@@ -53,6 +53,11 @@ class Settings(BaseSettings):
     groq_reasoning_effort: str = "low"      # low | medium | high | default
     deepinfra_model: str = "meta-llama/Meta-Llama-3.1-8B-Instruct"
 
+    # ── Voice (STT/TTS, Groq only — see app/intelligence/voice.py) ───────────
+    groq_stt_model: str = "whisper-large-v3-turbo"
+    groq_tts_model: str = "canopylabs/orpheus-v1-english"
+    groq_tts_voice: str = "hannah"
+
     # ── Telegram ─────────────────────────────────────────────────────────────
     telegram_bot_token: str = ""
     telegram_webhook_secret: str = ""
@@ -89,6 +94,7 @@ class Settings(BaseSettings):
     # ── Rate limits ──────────────────────────────────────────────────────────
     chat_rate_limit_per_day: int = 50
     sync_rate_limit_per_hour: int = 6
+    voice_rate_limit_per_day: int = 30
 
     @property
     def is_production(self) -> bool:
