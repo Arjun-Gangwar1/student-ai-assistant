@@ -174,6 +174,12 @@ Today: {today} (IST)
 Items:
 {items}
 
+one_line_summary states what the item says. Never comment on relevance in it --
+that is what the relevance number is for. Judging an item unimportant means a
+low relevance score, not a summary that says so.
+  Good: "Internship at Adobe, stipend Rs 1.1L/month, applications close Sunday"
+  Bad:  "Unstop internship offers, not relevant"
+
 Return only JSON, one object per item, echoing each item's id:
 {{"results":[{{"id":1,"category":"academic","priority":"HIGH","relevance":0.9,"one_line_summary":"..."}}]}}
 Return exactly {count} objects, one for every id from 1 to {count}."""
