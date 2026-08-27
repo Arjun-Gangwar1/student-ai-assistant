@@ -21,7 +21,7 @@ import logging
 import re
 
 from app.db import queries
-from app.intelligence.classifier import classify_item
+from app.intelligence.classifier import BATCH_SIZE, classify_item, classify_items
 from app.intelligence.embedder import embed_batch
 from app.intelligence.extractor import extract_deadlines
 from app.utils import token_budget
@@ -138,7 +138,13 @@ async def _process_batch(student: dict, limit: int) -> int:
 
     logger.info("Pipeline: %d unprocessed item(s) for %s", len(items), student_id)
 
-    # ── 1. Classify, concurrently but rate-bounded ───────────────────────────
+    # ── 1. Classify, in batches ──────────────────────────────────────────────
+    #
+    # One request per item exhausted the free tier twice over: 350 items cost
+    # ~241k tokens against a 200k/day cap, and 350 of the 1000 daily requests,
+    # because every call re-sent the same ~1k-character category rules. Ten
+    # items per call sends those once and drops the corpus to ~91k tokens and
+    # ~35 requests. Concurrency across batches stays bounded as before.
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_LLM)
 
     async def classify_one(item: dict) -> dict:
@@ -152,9 +158,29 @@ async def _process_batch(student: dict, limit: int) -> int:
                 branch=branch,
             )
 
-    classifications = await asyncio.gather(
-        *(classify_one(item) for item in items), return_exceptions=True
-    )
+    async def classify_batch(batch: list[dict]) -> list[dict | BaseException]:
+        if not token_budget.allow_background():
+            return [
+                RuntimeError("daily token budget reserved for chat — deferred to next run")
+            ] * len(batch)
+        async with semaphore:
+            results = await classify_items(batch, year=year, branch=branch)
+        if results is not None:
+            return list(results)
+
+        # The batch could not be trusted -- dropped or reordered entries would
+        # attach one item's summary to another row. Retry individually so a
+        # single malformed response costs accuracy on nothing.
+        logger.info("Batch of %d fell back to per-item classification", len(batch))
+        return list(
+            await asyncio.gather(*(classify_one(item) for item in batch),
+                                 return_exceptions=True)
+        )
+
+    batches = [items[i : i + BATCH_SIZE] for i in range(0, len(items), BATCH_SIZE)]
+    classifications: list[dict | BaseException] = []
+    for result in await asyncio.gather(*(classify_batch(b) for b in batches)):
+        classifications.extend(result)
 
     # ── 2. Extract deadlines where they plausibly exist ──────────────────────
     async def extract_one(item: dict) -> list[dict]:

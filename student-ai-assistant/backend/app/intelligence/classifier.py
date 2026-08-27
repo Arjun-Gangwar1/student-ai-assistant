@@ -103,9 +103,16 @@ async def classify_item(
     result = parse_json_response(raw)
     if not result:
         return dict(FALLBACK)
+    return _normalise(result)
 
-    # Validate rather than trust: an out-of-vocabulary category would violate
-    # the CHECK constraint and fail the write for the whole item.
+
+def _normalise(result: dict) -> dict:
+    """
+    Coerce one model result into the shape the DB accepts.
+
+    Validate rather than trust: an out-of-vocabulary category would violate the
+    CHECK constraint and fail the write for the whole item.
+    """
     category = str(result.get("category", "")).lower().strip()
     if category not in CATEGORIES:
         logger.debug("Unknown category %r from model, using 'general'", category)
@@ -129,3 +136,115 @@ async def classify_item(
         "relevance_score": relevance,
         "summary": summary,
     }
+
+
+# ── Batched classification ───────────────────────────────────────────────────
+#
+# Groq's free tier caps requests per DAY, not just tokens, and classification is
+# one request per item with no exceptions. A 350-item first sync burned 40% of
+# the 1000/day allowance for a single student, so roughly five signups would
+# exhaust the quota and every later student would silently receive nothing but
+# FALLBACK. Batching is the only lever that changes the shape of that cost:
+# ten items per call turns ~350 requests into ~35.
+
+BATCH_SIZE = 10
+
+# Far tighter than the 1500 a solo classify allows: ten of those would be a
+# 15k-character prompt, and the per-minute token ceiling is 8000. The corpus
+# median item is ~200 characters and the 90th percentile ~1400, so this keeps
+# most items whole while bounding the worst case.
+BATCH_ITEM_CHARS = 700
+
+BATCH_PROMPT = """Classify each student communication below.
+
+Student: year {year}, branch {branch}
+Today: {today} (IST)
+
+{rules}
+
+Items:
+{items}
+
+Return only JSON, one object per item, echoing each item's id:
+{{"results":[{{"id":1,"category":"academic","priority":"HIGH","relevance":0.9,"one_line_summary":"..."}}]}}
+Return exactly {count} objects, one for every id from 1 to {count}."""
+
+
+def _batch_rules() -> str:
+    """The category/priority definitions, shared with the single-item prompt."""
+    body = CLASSIFY_PROMPT.split("category — exactly one of:", 1)[1]
+    return "category — exactly one of:" + body.split("Text:", 1)[0].rstrip()
+
+
+async def classify_items(
+    items: list[dict],
+    year: int | None = None,
+    branch: str | None = None,
+) -> list[dict] | None:
+    """
+    Classify several items in one request.
+
+    Returns results positionally aligned with `items`, or None if the response
+    could not be trusted -- a partial or misaligned batch would attach one
+    student's summary to another item, so the caller retries individually
+    rather than persisting a guess.
+    """
+    if not items:
+        return []
+
+    lines = []
+    for index, item in enumerate(items, start=1):
+        title = (item.get("title") or "").strip()
+        body = (item.get("raw_content") or "").strip()[:BATCH_ITEM_CHARS]
+        lines.append(f"[{index}] {title}\n{body}".strip())
+
+    prompt = BATCH_PROMPT.format(
+        year=year or "unknown",
+        branch=branch or "unknown",
+        today=now_ist().strftime("%A, %d %B %Y"),
+        rules=_batch_rules(),
+        items="\n\n".join(lines),
+        count=len(items),
+    )
+
+    try:
+        raw = await llm().chat(
+            messages=[
+                {"role": "system", "content": CLASSIFY_SYSTEM},
+                {"role": "user", "content": prompt},
+            ],
+            json_mode=True,
+            temperature=0.0,
+            max_tokens=120 * len(items) + 100,
+        )
+    except Exception as exc:
+        logger.error("Batch classification call failed (%d items): %s", len(items), exc)
+        return None
+
+    payload = parse_json_response(raw)
+    results = payload.get("results")
+    if not isinstance(results, list):
+        logger.warning("Batch classification returned no results array")
+        return None
+
+    # Map by echoed id rather than by position: a model that drops or reorders
+    # an entry would otherwise shift every subsequent item's classification
+    # onto the wrong row, which is far worse than not classifying at all.
+    by_id: dict[int, dict] = {}
+    for entry in results:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            by_id[int(entry.get("id"))] = entry
+        except (TypeError, ValueError):
+            continue
+
+    missing = [i for i in range(1, len(items) + 1) if i not in by_id]
+    if missing:
+        logger.warning(
+            "Batch classification missing %d/%d ids — falling back to per-item",
+            len(missing), len(items),
+        )
+        return None
+
+    return [_normalise(by_id[i]) for i in range(1, len(items) + 1)]
