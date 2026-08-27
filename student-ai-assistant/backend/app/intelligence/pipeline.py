@@ -31,7 +31,12 @@ logger = logging.getLogger(__name__)
 # Groq's free tier allows ~30 requests/minute. Six concurrent classifications
 # with ~1s latency each lands near 30 rpm without bursting past it.
 MAX_CONCURRENT_LLM = 6
-EMBED_BATCH_SIZE = 32
+# Peak RSS scales with this, and the spike dwarfs the model itself. Measured
+# with 2000-char inputs (what _clean truncates to) on top of a 419MB loaded
+# model: batch 32 peaks at 1527MB, batch 16 at 1206MB, batch 8 at 969MB.
+# Embedding is not the slow part of a pass -- classification is -- so trading
+# throughput here for ~560MB of headroom is nearly free.
+EMBED_BATCH_SIZE = 8
 
 # Sources whose text is prose that may bury a date in a sentence. Classroom and
 # Calendar deliver structured due dates already, so paying for extraction there
