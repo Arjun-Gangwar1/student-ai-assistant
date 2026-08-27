@@ -136,6 +136,17 @@ for router in (auth, chat, deadlines, items, emails, sync, telegram_webhook, voi
     app.include_router(router.router)
 
 
+# Railway sets RAILWAY_GIT_COMMIT_SHA on every build; the others cover Render,
+# Vercel and Heroku so this keeps working if the host changes.
+COMMIT_SHA = (
+    os.environ.get("RAILWAY_GIT_COMMIT_SHA")
+    or os.environ.get("RENDER_GIT_COMMIT")
+    or os.environ.get("VERCEL_GIT_COMMIT_SHA")
+    or os.environ.get("SOURCE_VERSION")
+    or "unknown"
+)[:12]
+
+
 @app.get("/health", tags=["ops"])
 async def health():
     """Liveness plus a real database round trip — Railway polls this."""
@@ -156,5 +167,11 @@ async def health():
             "service": "student-ai-assistant",
             "version": app.version,
             "database": "up" if database_ok else "down",
+            # Which build is actually serving. Railway injects this; without it
+            # a deploy is unverifiable from outside -- "up" says nothing about
+            # whether the running container has the commit you just pushed, and
+            # acting on that assumption (a data migration, say) is how you
+            # corrupt rows with code you thought was already replaced.
+            "commit": COMMIT_SHA,
         },
     )
