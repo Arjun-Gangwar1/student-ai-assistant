@@ -64,6 +64,9 @@ async def index_upload(
         relevance_score=classification["relevance_score"],
         summary=classification["summary"] or filename,
         embedding=vector,
+        # A placeholder must not look classified, or the background pipeline
+        # will skip it forever and the document keeps a filename for a summary.
+        mark_processed=not classification.get("degraded"),
     )
 
     return item

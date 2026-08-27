@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from app.intelligence.classifier import FALLBACK, classify_items
+from app.intelligence.classifier import FALLBACK, classify_item, classify_items
 
 ITEMS = [
     {"title": "Assignment 3", "raw_content": "Due Friday 6pm on Classroom"},
@@ -132,3 +132,58 @@ class TestNormalisation:
         assert out[0]["priority"] == "LOW"
         assert out[0]["relevance_score"] == 1.0
         assert out[0].keys() == FALLBACK.keys()
+
+
+class TestDegradedMarker:
+    """
+    A failed call and a genuine "general" verdict used to produce identical
+    rows. A day of 429s therefore marked 93% of a real corpus classified, and
+    since nothing rescans processed rows, those placeholders were permanent.
+    """
+
+    @pytest.mark.asyncio
+    async def test_api_failure_is_marked_degraded(self):
+        client = AsyncMock()
+        client.chat = AsyncMock(side_effect=RuntimeError("429 tokens per day"))
+        with patch("app.intelligence.classifier.llm", return_value=client):
+            result = await classify_item("Quiz 1 on Friday", title="Statistics")
+
+        assert result["degraded"] is True
+        assert result["category"] == "general"
+
+    @pytest.mark.asyncio
+    async def test_unparseable_output_is_marked_degraded(self):
+        with patch("app.intelligence.classifier.llm", return_value=_mock_llm("¯\\_(ツ)_/¯")):
+            result = await classify_item("Quiz 1 on Friday", title="Statistics")
+
+        assert result["degraded"] is True
+
+    @pytest.mark.asyncio
+    async def test_a_real_general_verdict_is_not_degraded(self):
+        """The distinction the old code could not make."""
+        payload = {"category": "general", "priority": "LOW",
+                   "relevance": 0.4, "one_line_summary": "Newsletter"}
+        with patch("app.intelligence.classifier.llm", return_value=_mock_llm(payload)):
+            result = await classify_item("Weekly newsletter", title="News")
+
+        assert result["degraded"] is False
+        assert result["category"] == "general"
+        assert result["priority"] == "LOW"
+
+    @pytest.mark.asyncio
+    async def test_empty_input_is_not_degraded(self):
+        """Nothing to classify is a real answer; retrying it forever burns quota."""
+        client = AsyncMock()
+        with patch("app.intelligence.classifier.llm", return_value=client):
+            result = await classify_item("   ", title=None)
+
+        assert result["degraded"] is False
+        client.chat.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_batched_results_are_not_degraded(self):
+        payload = {"results": [_entry(1), _entry(2), _entry(3)]}
+        with patch("app.intelligence.classifier.llm", return_value=_mock_llm(payload)):
+            out = await classify_items(ITEMS)
+
+        assert all(r["degraded"] is False for r in out)

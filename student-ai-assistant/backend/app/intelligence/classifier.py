@@ -64,6 +64,12 @@ FALLBACK = {
     "priority": "LOW",
     "relevance_score": 0.4,
     "summary": "",
+    # Set only when the model did not actually answer. A genuine "general"
+    # verdict and a quota-exhausted failure produced byte-identical rows, so a
+    # day of 429s silently marked 93% of a corpus classified and, because
+    # processed_at was stamped anyway, nothing ever retried them. Callers must
+    # branch on this rather than on the values.
+    "degraded": True,
 }
 
 
@@ -77,7 +83,9 @@ async def classify_item(
     text = f"{title}\n\n{raw_content}" if title else raw_content
     text = text.strip()
     if not text:
-        return dict(FALLBACK)
+        # Nothing to classify is a real answer, not a degraded one; retrying an
+        # empty item forever would burn quota to reach the same conclusion.
+        return dict(FALLBACK, degraded=False)
 
     prompt = CLASSIFY_PROMPT.format(
         year=year or "unknown",
@@ -135,6 +143,7 @@ def _normalise(result: dict) -> dict:
         "priority": priority,
         "relevance_score": relevance,
         "summary": summary,
+        "degraded": False,
     }
 
 

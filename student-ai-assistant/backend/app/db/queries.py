@@ -448,8 +448,17 @@ async def save_item_analysis(
     embedding: list[float] | None,
     deadline: datetime | None = None,
     confidence: float | None = None,
+    mark_processed: bool = True,
 ) -> None:
-    """Write back everything the intelligence pipeline produced, in one update."""
+    """
+    Write back everything the intelligence pipeline produced, in one update.
+
+    `mark_processed=False` keeps processed_at NULL so the item stays in the
+    unprocessed queue. Used when the analysis is a placeholder the model never
+    actually produced: the embedding is still worth saving so the item is
+    searchable now, but stamping it processed would freeze the placeholder in
+    permanently, since nothing ever rescans processed rows.
+    """
     async with acquire() as conn:
         await conn.execute(
             """
@@ -462,7 +471,7 @@ async def save_item_analysis(
                                           THEN embedding ELSE $6::vector END,
                    deadline        = COALESCE(items.deadline, $7),
                    confidence      = COALESCE($8, items.confidence),
-                   processed_at    = now()
+                   processed_at    = CASE WHEN $9 THEN now() ELSE processed_at END
              WHERE id = $1
             """,
             item_id,
@@ -473,6 +482,7 @@ async def save_item_analysis(
             to_vector_literal(embedding) if embedding else None,
             deadline,
             confidence,
+            mark_processed,
         )
 
 

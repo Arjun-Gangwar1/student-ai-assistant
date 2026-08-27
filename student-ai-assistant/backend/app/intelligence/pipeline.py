@@ -221,11 +221,19 @@ async def _process_batch(student: dict, limit: int) -> int:
 
     # ── 4. Persist ───────────────────────────────────────────────────────────
     processed = 0
+    degraded = 0
     for item, classification, extracted, vector in zip(items, classifications, extractions, vectors):
         item_id = str(item["id"])
 
         if isinstance(classification, BaseException):
             logger.error("Classification failed for item %s: %s", item_id, classification)
+            continue
+        if classification.get("degraded"):
+            # The model never answered -- quota, timeout, unparseable output.
+            # Persisting would stamp processed_at and freeze a placeholder in
+            # forever, because nothing rescans processed rows. Leave it for the
+            # next run instead.
+            degraded += 1
             continue
         if isinstance(extracted, BaseException):
             logger.error("Extraction failed for item %s: %s", item_id, extracted)
@@ -261,5 +269,11 @@ async def _process_batch(student: dict, limit: int) -> int:
         except Exception as exc:
             logger.error("Persisting item %s failed: %s", item_id, exc)
 
+    if degraded:
+        logger.warning(
+            "Pipeline: %d/%d item(s) left unclassified for %s (model unavailable) — "
+            "they stay unprocessed and will be retried",
+            degraded, len(items), student_id,
+        )
     logger.info("Pipeline: processed %d/%d item(s) for %s", processed, len(items), student_id)
     return processed
