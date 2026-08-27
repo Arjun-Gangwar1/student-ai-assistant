@@ -76,6 +76,24 @@ class BaseLLMClient(ABC):
         ...
 
 
+# "Please try again in 4m28.272s" / "in 55.372s" -- Groq states when the limit
+# frees up, which is better information than any local guess.
+_RETRY_AFTER_RE = re.compile(
+    r"try again in\s+(?:(\d+)m)?([\d.]+)s", re.IGNORECASE
+)
+
+
+def _parse_retry_after(message: str) -> float | None:
+    match = _RETRY_AFTER_RE.search(message)
+    if not match:
+        return None
+    minutes, seconds = match.group(1), match.group(2)
+    try:
+        return (int(minutes) * 60 if minutes else 0) + float(seconds)
+    except ValueError:
+        return None
+
+
 def _wrap(exc: Exception) -> LLMError:
     """
     Normalise a provider exception, distinguishing a per-day quota hit (not
@@ -83,6 +101,10 @@ def _wrap(exc: Exception) -> LLMError:
     """
     message = str(exc)
     if "per day" in message.lower():
+        # Tell the budget what the provider said. Without this the local
+        # estimate stays optimistic across a restart and every sync spends its
+        # request allowance rediscovering the same 429.
+        token_budget.note_exhausted(_parse_retry_after(message))
         return LLMQuotaExhausted(f"groq: {type(exc).__name__}: {exc}")
     return LLMError(f"groq: {type(exc).__name__}: {exc}")
 

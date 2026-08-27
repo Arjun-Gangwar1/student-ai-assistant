@@ -33,18 +33,50 @@ CHAT_RESERVE = 40_000
 
 _SECONDS_PER_DAY = 86_400
 
+# How long to stay quiet after a quota 429 that carries no retry hint. Short
+# enough that a rolling-window limit recovers on its own, long enough that a
+# 30-minute sync interval does not spend its whole request allowance failing.
+DEFAULT_COOLDOWN_SECONDS = 900
+
 _day_start = time.time() - (time.time() % _SECONDS_PER_DAY)
 _used = 0
 _warned_background = False
+_exhausted_until = 0.0
 
 
 def _roll_if_new_day() -> None:
-    global _day_start, _used, _warned_background
+    global _day_start, _used, _warned_background, _exhausted_until
     now = time.time()
     if now - _day_start >= _SECONDS_PER_DAY:
         _day_start = now - (now % _SECONDS_PER_DAY)
         _used = 0
         _warned_background = False
+        _exhausted_until = 0.0
+
+
+def note_exhausted(retry_after: float | None = None) -> None:
+    """
+    Record that the provider itself refused on quota.
+
+    The local counter is only an estimate and resets when the process does, so
+    after a deploy it reports a full budget while the server-side quota is
+    still spent. Every sync then spends its request allowance collecting 429s.
+    Trusting the provider's own answer is strictly better information than our
+    estimate, so it wins until the stated retry time.
+    """
+    global _exhausted_until
+    cooldown = retry_after if retry_after and retry_after > 0 else DEFAULT_COOLDOWN_SECONDS
+    until = time.time() + cooldown
+    if until > _exhausted_until:
+        _exhausted_until = until
+        logger.warning(
+            "Provider reported quota exhausted — pausing LLM calls for %.0fs", cooldown
+        )
+
+
+def exhausted_for() -> float:
+    """Seconds until the provider-reported pause lifts; 0 when not paused."""
+    return max(0.0, _exhausted_until - time.time())
 
 
 def record(tokens: int) -> None:
@@ -58,6 +90,8 @@ def record(tokens: int) -> None:
 
 def remaining() -> int:
     _roll_if_new_day()
+    if exhausted_for() > 0:
+        return 0
     return max(0, DAILY_TOKEN_LIMIT - _used)
 
 
